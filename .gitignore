@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.env
+lti_demo.db
+.DS_Store
+.vscode/
+.idea/
+/.venv
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.streamlit/
