@@ -9,6 +9,7 @@ import io
 import base64
 import os
 from dotenv import load_dotenv
+import requests  # ADD THIS LINE
 
 # Load environment variables
 load_dotenv()
@@ -32,7 +33,27 @@ try:
 except ImportError:
     PDF2IMAGE_AVAILABLE = False
 
-from database import get_session
+
+# Add this BEFORE init_session_state()
+def get_session_from_api(session_id):
+    """Fetch session from Flask LTI server"""
+    # REPLACE THIS URL with your actual Render URL once deployed
+    FLASK_API_URL = os.environ.get('FLASK_API_URL', 'https://moqayim.onrender.com')
+    
+    try:
+        response = requests.get(
+            f"{FLASK_API_URL}/api/session/{session_id}",
+            timeout=5
+        )
+        if response.status_code == 200:
+            return response.json()
+        else:
+            print(f"Session not found: {session_id}")
+            return None
+    except Exception as e:
+        print(f"Error fetching session: {str(e)}")
+        return None
+
 
 def init_session_state():
     """Initialize session state variables"""
@@ -41,10 +62,10 @@ def init_session_state():
     query_params = st.query_params
     if 'session' in query_params:
         session_id = query_params['session']
-        role = query_params.get('role', 'student')
+        role = query_params.get('role', ['student'])[0] if isinstance(query_params.get('role'), list) else query_params.get('role', 'student')
         
-        # Load LTI session data
-        lti_data = get_session(session_id)
+        # Load LTI session data from Flask API
+        lti_data = get_session_from_api(session_id)
         if lti_data:
             st.session_state.lti_session = lti_data
             st.session_state.user_role = role
@@ -1000,4 +1021,5 @@ def main():
         page3_results()
 
 if __name__ == "__main__":
+
     main()
