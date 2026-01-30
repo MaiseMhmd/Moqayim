@@ -1,28 +1,40 @@
 from flask import Flask, request, redirect, render_template_string, jsonify
 import secrets
-from database import init_db, save_session
+import os
+from database import init_db, save_session, get_session
 
 app = Flask(__name__)
-app.secret_key = 'your-secret-key-change-this'
+app.secret_key = os.environ.get('FLASK_SECRET_KEY', 'your-secret-key-change-this')
 
 # Initialize database
 init_db()
 
-# LTI Configuration - you'll get these from Blackboard admin
+# LTI Configuration
+# IMPORTANT: Change these to your own values!
 CONSUMERS = {
-    'your_consumer_key': {
-        'secret': 'your_consumer_secret'
+    'moqayim_key': {  # This is your Tool Provider Key
+        'secret': 'moqayim_secret'  # This is your Tool Provider Secret
     }
 }
+
+# Get Streamlit URL from environment or use default
+STREAMLIT_URL = os.environ.get('STREAMLIT_URL', 'https://mogayim.streamlit.app/#moqayim-short-answer-grading')
+
+@app.route('/')
+def home():
+    return "✅ Moqayim LTI Server is running!", 200
 
 @app.route('/lti/config', methods=['GET'])
 def lti_config():
     """LTI configuration XML for Blackboard"""
-    config_xml = '''<?xml version="1.0" encoding="UTF-8"?>
+    # This will use your actual Render URL automatically
+    base_url = request.host_url.rstrip('/')
+    
+    config_xml = f'''<?xml version="1.0" encoding="UTF-8"?>
     <cartridge_basiclti_link xmlns="http://www.imsglobal.org/xsd/imslticc_v1p0">
         <title>Moqayim Grading Tool</title>
         <description>AI-powered short answer grading</description>
-        <launch_url>http://YOUR_PUBLIC_URL/lti/launch</launch_url>
+        <launch_url>{base_url}/lti/launch</launch_url>
     </cartridge_basiclti_link>'''
     return config_xml, 200, {'Content-Type': 'application/xml'}
 
@@ -33,7 +45,7 @@ def lti_launch():
     try:
         # For testing, accept both POST and GET
         if request.method == 'GET':
-            return "LTI endpoint is working! Use POST with LTI parameters to launch.", 200
+            return "✅ LTI endpoint is working! Use POST with LTI parameters to launch.", 200
         
         # Extract LTI parameters from POST data
         user_id = request.form.get('user_id', 'demo_user')
@@ -58,7 +70,7 @@ def lti_launch():
         print(f"✅ Session created: {session_id}")
         
         # Redirect to Streamlit with session ID
-        streamlit_url = f"http://localhost:8501?session={session_id}&role={role}"
+        streamlit_url = f"{STREAMLIT_URL}?session={session_id}&role={role}"
         
         # Show redirect page
         return render_template_string('''
@@ -124,6 +136,18 @@ def lti_launch():
         traceback.print_exc()
         return f"Error: {str(e)}", 500
 
+@app.route('/api/session/<session_id>', methods=['GET'])
+def api_get_session(session_id):
+    """API endpoint for Streamlit to fetch session"""
+    try:
+        session_data = get_session(session_id)
+        if session_data:
+            return jsonify(session_data), 200
+        return jsonify({'error': 'Session not found'}), 404
+    except Exception as e:
+        print(f"❌ Error fetching session: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/lti/grade', methods=['POST'])
 def grade_passback():
     """Receive grades from Streamlit and send back to Blackboard"""
@@ -138,14 +162,14 @@ def grade_passback():
 @app.route('/health', methods=['GET'])
 def health():
     """Health check endpoint"""
-    return {'status': 'healthy', 'app': 'moqayim-lti'}, 200
+    return {'status': 'healthy', 'app': 'moqayim-lti', 'streamlit_url': STREAMLIT_URL}, 200
 
 if __name__ == '__main__':
     print("="*60)
     print("🚀 Moqayim LTI Server Starting...")
     print("="*60)
-    print("📍 LTI Launch URL: http://localhost:5000/lti/launch")
-    print("📍 Config URL: http://localhost:5000/lti/config")
-    print("📍 Health Check: http://localhost:5000/health")
+    print(f"📍 Streamlit URL: {STREAMLIT_URL}")
     print("="*60)
-    app.run(port=5000, debug=True)
+    # Render uses PORT environment variable
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port, debug=False)
