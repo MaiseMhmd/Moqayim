@@ -18,7 +18,7 @@ CONSUMERS = {
 }
 
 # Get Streamlit URL from environment or use default
-STREAMLIT_URL = os.environ.get('STREAMLIT_URL', 'https://mogayim.streamlit.app/')
+STREAMLIT_URL = os.environ.get('STREAMLIT_URL', 'https://mogayim.streamlit.app')
 
 @app.route('/')
 def home():
@@ -173,5 +173,6 @@ if __name__ == '__main__':
     # Render uses PORT environment variable
     port = int(os.environ.get('PORT', 10000))
     app.run(host='0.0.0.0', port=port, debug=False)
+
 
 
