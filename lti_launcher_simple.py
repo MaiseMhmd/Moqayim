@@ -576,7 +576,9 @@ def validate_lti_request(request_data):
 # HTML TEMPLATES
 # ============================================================================
 
-BASE_TEMPLATE = """
+def render_page(content_html, lang, **kwargs):
+    """Render a page with the base template"""
+    base = """
 <!DOCTYPE html>
 <html lang="{{ 'ar' if lang == 'ar' else 'en' }}" dir="{{ 'rtl' if lang == 'ar' else 'ltr' }}">
 <head>
@@ -912,23 +914,16 @@ BASE_TEMPLATE = """
             </div>
             {% endif %}
             
-            {% with messages = get_flashed_messages(with_categories=true) %}
-                {% if messages %}
-                    {% for category, message in messages %}
-                        <div class="alert alert-{{ category }}">{{ message }}</div>
-                    {% endfor %}
-                {% endif %}
-            {% endwith %}
-            
-            {% block content %}{% endblock %}
+            {{ content | safe }}
         </div>
     </div>
 </body>
 </html>
 """
+    
+    return render_template_string(base, content=content_html, lang=lang, t=t, **kwargs)
 
-PAGE1_TEMPLATE = BASE_TEMPLATE + """
-{% block content %}
+PAGE1_CONTENT = """
 <h2 style="margin-bottom: 25px;">{{ t('page1_title', lang) }}</h2>
 
 <form method="POST" enctype="multipart/form-data">
@@ -1014,11 +1009,9 @@ PAGE1_TEMPLATE = BASE_TEMPLATE + """
         <button type="submit" class="btn btn-primary">{{ t('next', lang) }}</button>
     </div>
 </form>
-{% endblock %}
 """
 
-PAGE2_TEMPLATE = BASE_TEMPLATE + """
-{% block content %}
+PAGE2_CONTENT = """
 <h2 style="margin-bottom: 25px;">{{ t('page2_title', lang) }}</h2>
 
 <div class="alert alert-info">
@@ -1066,11 +1059,9 @@ PAGE2_TEMPLATE = BASE_TEMPLATE + """
         <button type="submit" class="btn btn-primary">{{ t('submit_answer', lang) }}</button>
     </div>
 </form>
-{% endblock %}
 """
 
-PAGE3_TEMPLATE = BASE_TEMPLATE + """
-{% block content %}
+PAGE3_CONTENT = """
 <h2 style="margin-bottom: 25px;">{{ t('page3_title', lang) }}</h2>
 
 <div class="score-card">
@@ -1115,7 +1106,6 @@ PAGE3_TEMPLATE = BASE_TEMPLATE + """
     <a href="{{ url_for('page2') }}" class="btn btn-secondary">{{ t('back', lang) }}</a>
     <a href="{{ url_for('reset') }}" class="btn btn-danger">{{ t('reset', lang) }}</a>
 </div>
-{% endblock %}
 """
 
 # ============================================================================
@@ -1167,16 +1157,16 @@ def page1():
                 session['extracted_text'] = extracted_text
                 return redirect(url_for('page1', lang=lang))
             except Exception as e:
-                return render_template_string(
-                    PAGE1_TEMPLATE,
-                    lang=lang,
-                    t=t,
+                return render_page(
+                    PAGE1_CONTENT,
+                    lang,
                     num_criteria=session.get('num_criteria', 3),
                     error=str(e),
                     groq_available=GROQ_AVAILABLE,
                     groq_api_key=GROQ_API_KEY,
                     lti_user=session.get('lti_user_name'),
-                    lti_role=session.get('lti_role')
+                    lti_role=session.get('lti_role'),
+                    url_for=url_for
                 )
         
         # Handle add criterion
@@ -1208,16 +1198,16 @@ def page1():
                 })
         
         if not question or not model_answer or len(rubric) == 0:
-            return render_template_string(
-                PAGE1_TEMPLATE,
-                lang=lang,
-                t=t,
+            return render_page(
+                PAGE1_CONTENT,
+                lang,
                 num_criteria=num_criteria,
                 error="Please fill in all required fields.",
                 groq_available=GROQ_AVAILABLE,
                 groq_api_key=GROQ_API_KEY,
                 lti_user=session.get('lti_user_name'),
-                lti_role=session.get('lti_role')
+                lti_role=session.get('lti_role'),
+                url_for=url_for
             )
         
         session['assessment_config'] = {
@@ -1230,10 +1220,9 @@ def page1():
         return redirect(url_for('page2', lang=lang))
     
     # GET request
-    return render_template_string(
-        PAGE1_TEMPLATE,
-        lang=lang,
-        t=t,
+    return render_page(
+        PAGE1_CONTENT,
+        lang,
         num_criteria=session.get('num_criteria', 3),
         question=session.get('extracted_question', ''),
         model_answer=session.get('extracted_answer', ''),
@@ -1241,7 +1230,8 @@ def page1():
         groq_available=GROQ_AVAILABLE,
         groq_api_key=GROQ_API_KEY,
         lti_user=session.get('lti_user_name'),
-        lti_role=session.get('lti_role')
+        lti_role=session.get('lti_role'),
+        url_for=url_for
     )
 
 @app.route('/page2', methods=['GET', 'POST'])
@@ -1264,28 +1254,28 @@ def page2():
                 session['student_extracted_text'] = extracted_text
                 return redirect(url_for('page2', lang=lang))
             except Exception as e:
-                return render_template_string(
-                    PAGE2_TEMPLATE,
-                    lang=lang,
-                    t=t,
+                return render_page(
+                    PAGE2_CONTENT,
+                    lang,
                     question=config['question'],
                     error=str(e),
                     lti_user=session.get('lti_user_name'),
-                    lti_role=session.get('lti_role')
+                    lti_role=session.get('lti_role'),
+                    url_for=url_for
                 )
         
         # Handle answer submission
         student_answer = request.form.get('student_answer')
         
         if not student_answer or not student_answer.strip():
-            return render_template_string(
-                PAGE2_TEMPLATE,
-                lang=lang,
-                t=t,
+            return render_page(
+                PAGE2_CONTENT,
+                lang,
                 question=config['question'],
                 error="Please provide an answer.",
                 lti_user=session.get('lti_user_name'),
-                lti_role=session.get('lti_role')
+                lti_role=session.get('lti_role'),
+                url_for=url_for
             )
         
         # Create assessment objects
@@ -1334,15 +1324,15 @@ def page2():
         return redirect(url_for('page3', lang=lang))
     
     # GET request
-    return render_template_string(
-        PAGE2_TEMPLATE,
-        lang=lang,
-        t=t,
+    return render_page(
+        PAGE2_CONTENT,
+        lang,
         question=config['question'],
         student_answer=session.get('student_extracted_answer', ''),
         student_extracted_text=session.get('student_extracted_text', ''),
         lti_user=session.get('lti_user_name'),
-        lti_role=session.get('lti_role')
+        lti_role=session.get('lti_role'),
+        url_for=url_for
     )
 
 @app.route('/page3')
@@ -1355,10 +1345,9 @@ def page3():
     
     report = session['grading_report']
     
-    return render_template_string(
-        PAGE3_TEMPLATE,
-        lang=lang,
-        t=t,
+    return render_page(
+        PAGE3_CONTENT,
+        lang,
         total_score=report['total_score'],
         max_score=report['max_score'],
         percentage=report['percentage'],
@@ -1366,7 +1355,8 @@ def page3():
         feedback=report['feedback'],
         student_answer=session.get('student_answer', ''),
         lti_user=session.get('lti_user_name'),
-        lti_role=session.get('lti_role')
+        lti_role=session.get('lti_role'),
+        url_for=url_for
     )
 
 @app.route('/reset')
