@@ -1,482 +1,1386 @@
-from flask import Flask, request, redirect, render_template_string, jsonify, make_response
-import secrets
 import os
-import hashlib
-import hmac
-import time
-from urllib.parse import quote, unquote
-from database import init_db, save_session, get_session
+import re
+import math
+import io
+import base64
+import secrets
+from dataclasses import dataclass, field
+from typing import List, Dict, Literal, Optional
+from collections import Counter
+from datetime import datetime, timedelta
+
+from flask import Flask, request, render_template_string, session, redirect, url_for, jsonify
+from werkzeug.utils import secure_filename
+from PIL import Image
+
+# Try to import optional dependencies
+try:
+    from groq import Groq
+    GROQ_AVAILABLE = True
+except ImportError:
+    GROQ_AVAILABLE = False
+
+try:
+    import PyPDF2
+    PYPDF2_AVAILABLE = True
+except ImportError:
+    PYPDF2_AVAILABLE = False
+
+try:
+    import pdf2image
+    PDF2IMAGE_AVAILABLE = True
+except ImportError:
+    PDF2IMAGE_AVAILABLE = False
+
+# ============================================================================
+# FLASK APP INITIALIZATION
+# ============================================================================
 
 app = Flask(__name__)
-app.secret_key = os.environ.get('FLASK_SECRET_KEY', 'your-secret-key-change-this')
-
-# Initialize database
-init_db()
+app.secret_key = os.environ.get('FLASK_SECRET_KEY', secrets.token_hex(32))
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+app.config['UPLOAD_FOLDER'] = '/tmp/uploads'
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=2)
 
 # LTI Configuration
-# IMPORTANT: These must match what you gave to Blackboard admin
-CONSUMERS = {
-    'moqayim_key': {  # This is your Tool Provider Key
-        'secret': 'moqayim_secret'  # This is your Tool Provider Secret
+LTI_CONSUMER_KEY = os.environ.get('LTI_CONSUMER_KEY', 'moqayim_key')
+LTI_SHARED_SECRET = os.environ.get('LTI_SHARED_SECRET', 'moqayim_secret')
+GROQ_API_KEY = os.environ.get('GROQ_API_KEY')
+
+# Create upload folder if it doesn't exist
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+
+# ============================================================================
+# DATA MODELS
+# ============================================================================
+
+@dataclass
+class RubricCriterion:
+    """Single grading criterion with marks allocation"""
+    name: str
+    marks: int
+    key_points: List[str] = field(default_factory=list)
+    hints: List[str] = field(default_factory=list)
+
+@dataclass
+class AssessmentConfig:
+    """Teacher-defined assessment configuration"""
+    question: str
+    model_answer: str
+    rubric: List[RubricCriterion]
+    language: Literal["en", "ar"] = "en"
+
+@dataclass
+class StudentSubmission:
+    """Student's submitted answer"""
+    answer: str
+    language: Literal["en", "ar"] = "en"
+
+@dataclass
+class CriterionResult:
+    """Grading result for one criterion"""
+    criterion_name: str
+    status: Literal["met", "partial", "not_met"]
+    marks_awarded: int
+    marks_total: int
+    justification: str
+
+@dataclass
+class GradingReport:
+    """Complete grading report"""
+    criterion_results: List[CriterionResult]
+    total_score: int
+    max_score: int
+    feedback: List[str]
+
+# ============================================================================
+# GROQ OCR PROCESSING
+# ============================================================================
+
+class GroqOCR:
+    """Extract text from images using Groq's Llama Maverick vision model"""
+    
+    def __init__(self, api_key: Optional[str] = None):
+        """Initialize Groq client with API key"""
+        if not GROQ_AVAILABLE:
+            raise ImportError("Groq library not installed. Install with: pip install groq")
+        
+        self.client = Groq(api_key=api_key) if api_key else Groq()
+    
+    @staticmethod
+    def image_to_base64_url(image: Image.Image) -> str:
+        """Convert PIL Image to base64 data URL"""
+        buffered = io.BytesIO()
+        if image.mode in ('RGBA', 'LA', 'P'):
+            image = image.convert('RGB')
+        image.save(buffered, format="PNG")
+        img_bytes = buffered.getvalue()
+        img_base64 = base64.b64encode(img_bytes).decode('utf-8')
+        return f"data:image/png;base64,{img_base64}"
+    
+    def extract_text(self, image: Image.Image, language: str = "en") -> str:
+        """Extract text from image using Groq Llama Maverick"""
+        try:
+            width, height = image.size
+            total_pixels = width * height
+            if total_pixels > 33177600:
+                scale = math.sqrt(33177600 / total_pixels)
+                new_width = int(width * scale)
+                new_height = int(height * scale)
+                image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            
+            image_url = self.image_to_base64_url(image)
+            
+            base64_size = len(image_url.encode('utf-8'))
+            if base64_size > 4 * 1024 * 1024:
+                raise Exception(f"Image too large after encoding: {base64_size} bytes")
+            
+            if language == "ar":
+                prompt = "استخرج كل النص الموجود في هذه الصورة بدقة عالية جداً. يشمل ذلك النص المكتوب بخط اليد والنص المطبوع والكتابة اليدوية غير الواضحة. اقرأ بعناية حرفاً بحرف وكلمة بكلمة. إذا كان النص مكتوباً بخط اليد، حاول التعرف على الحروف والكلمات حتى لو كانت مشوهة أو غير منتظمة. أعد النص المستخرج فقط بدون أي تعليقات أو تنسيق إضافي أو شرح."
+            else:
+                prompt = "Extract all text from this image with very high accuracy. This includes handwritten text, printed text, and unclear handwriting. Read carefully letter by letter and word by word. If the text is handwritten, try to recognize the letters and words even if they are distorted or irregular. Return only the extracted text without any comments, additional formatting, or explanations."
+            
+            completion = self.client.chat.completions.create(
+                model="meta-llama/llama-4-maverick-17b-128e-instruct",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": image_url}}
+                        ]
+                    }
+                ],
+                temperature=0.1,
+                max_completion_tokens=2048,
+                top_p=1,
+                stream=False,
+                stop=None
+            )
+            
+            extracted_text = completion.choices[0].message.content
+            if not extracted_text or extracted_text.strip() == "":
+                raise Exception("No text was extracted from the image.")
+            return extracted_text.strip()
+            
+        except Exception as e:
+            error_msg = str(e)
+            if "rate limit" in error_msg.lower():
+                raise Exception("API rate limit exceeded. Please try again later.")
+            elif "size" in error_msg.lower() or "large" in error_msg.lower():
+                raise Exception("Image file is too large. Please use a smaller image.")
+            else:
+                raise Exception(f"OCR failed: {error_msg}")
+
+# ============================================================================
+# DOCUMENT PROCESSING
+# ============================================================================
+
+class DocumentProcessor:
+    """Extract text from PDFs and images using Groq OCR"""
+    
+    @staticmethod
+    def extract_text_from_image(image: Image.Image, language: str = "en", api_key: Optional[str] = None) -> str:
+        """Extract text from a PIL Image using Groq"""
+        if not GROQ_AVAILABLE:
+            raise Exception("Groq library is not installed.")
+        
+        try:
+            ocr = GroqOCR(api_key=api_key)
+            return ocr.extract_text(image, language)
+        except Exception as e:
+            raise Exception(f"Image OCR failed: {str(e)}")
+    
+    @staticmethod
+    def extract_text_from_pdf_text(pdf_file) -> str:
+        """Extract text from PDF using PyPDF2"""
+        if not PYPDF2_AVAILABLE:
+            return ""
+        
+        try:
+            pdf_file.seek(0)
+            pdf_reader = PyPDF2.PdfReader(pdf_file)
+            text_parts = []
+            
+            for page_num, page in enumerate(pdf_reader.pages):
+                page_text = page.extract_text()
+                if page_text.strip():
+                    text_parts.append(f"--- Page {page_num + 1} ---\n{page_text}")
+            
+            return "\n\n".join(text_parts)
+        except Exception:
+            return ""
+    
+    @staticmethod
+    def extract_text_from_pdf_ocr(pdf_file, language: str = "en", api_key: Optional[str] = None) -> str:
+        """Extract text from PDF using Groq OCR"""
+        if not PDF2IMAGE_AVAILABLE:
+            raise Exception("pdf2image is not installed.")
+        
+        if not GROQ_AVAILABLE:
+            raise Exception("Groq library is not installed.")
+        
+        try:
+            pdf_file.seek(0)
+            images = pdf2image.convert_from_bytes(pdf_file.read(), dpi=300)
+            
+            ocr = GroqOCR(api_key=api_key)
+            
+            full_text = []
+            for i, image in enumerate(images):
+                page_text = ocr.extract_text(image, language)
+                if page_text:
+                    full_text.append(f"--- Page {i+1} ---\n{page_text}")
+            
+            return "\n\n".join(full_text)
+        except Exception as e:
+            raise Exception(f"PDF OCR failed: {str(e)}")
+    
+    @staticmethod
+    def process_uploaded_file(file_storage, language: str = "en", api_key: Optional[str] = None) -> str:
+        """Process uploaded file (PDF or image) using Groq OCR"""
+        if file_storage is None:
+            return ""
+        
+        file_type = file_storage.content_type
+        
+        try:
+            if file_type == "application/pdf":
+                text = DocumentProcessor.extract_text_from_pdf_text(file_storage.stream)
+                
+                if not text or len(text.strip()) < 50:
+                    text = DocumentProcessor.extract_text_from_pdf_ocr(file_storage.stream, language, api_key)
+                
+                return text
+                
+            elif file_type.startswith("image/"):
+                image = Image.open(file_storage.stream)
+                return DocumentProcessor.extract_text_from_image(image, language, api_key)
+            else:
+                raise Exception("Unsupported file type. Please upload PDF or image files.")
+        except Exception as e:
+            raise Exception(f"File processing error: {str(e)}")
+    
+    @staticmethod
+    def smart_split_qa(extracted_text: str) -> tuple:
+        """Intelligently split extracted text into question and answer"""
+        text = extracted_text.strip()
+        
+        text = re.sub(r'---\s*Page\s+\d+\s*---', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'\s+', ' ', text).strip()
+        
+        patterns = [
+            (r'(?i)question[:\s]+(.*?)(?:answer[:\s]+|model\s+answer[:\s]+|solution[:\s]+)(.*)', 1, 2),
+            (r'(?i)q[:\.\s]+(.*?)(?:a[:\.\s]+|ans[:\.\s]+)(.*)', 1, 2),
+            (r'(?i)(.*?)(?:answer[:\s]+|solution[:\s]+|model\s+answer[:\s]+)(.*)', 1, 2),
+        ]
+        
+        for pattern, q_group, a_group in patterns:
+            match = re.search(pattern, text, re.DOTALL)
+            if match:
+                question = match.group(q_group).strip()
+                answer = match.group(a_group).strip()
+                
+                if len(question) > 10 and len(answer) > 10:
+                    return question, answer
+        
+        lines = text.split('\n')
+        if len(lines) > 3:
+            mid = len(lines) // 2
+            question = '\n'.join(lines[:mid]).strip()
+            answer = '\n'.join(lines[mid:]).strip()
+        else:
+            sentences = re.split(r'[.!?]+', text)
+            mid = len(sentences) // 2
+            question = '.'.join(sentences[:mid]).strip()
+            answer = '.'.join(sentences[mid:]).strip()
+        
+        return question, answer
+
+# ============================================================================
+# GRADING ENGINE
+# ============================================================================
+
+class GradingEngine:
+    """Deterministic rubric-based grading engine"""
+    
+    @staticmethod
+    def normalize_text(text: str) -> str:
+        """Normalize text for comparison"""
+        text = text.lower()
+        text = re.sub(r'[^\w\s]', ' ', text)
+        text = re.sub(r'\s+', ' ', text)
+        return text.strip()
+    
+    @staticmethod
+    def tokenize(text: str) -> List[str]:
+        """Split normalized text into tokens"""
+        return GradingEngine.normalize_text(text).split()
+    
+    @staticmethod
+    def calculate_overlap(student_tokens: List[str], reference_tokens: List[str]) -> float:
+        """Calculate token overlap ratio"""
+        if not reference_tokens:
+            return 0.0
+        student_set = set(student_tokens)
+        reference_set = set(reference_tokens)
+        intersection = len(student_set & reference_set)
+        return intersection / len(reference_set)
+    
+    @staticmethod
+    def calculate_cosine_similarity(student_tokens: List[str], reference_tokens: List[str]) -> float:
+        """Calculate TF-based cosine similarity"""
+        if not student_tokens or not reference_tokens:
+            return 0.0
+        
+        student_counts = Counter(student_tokens)
+        reference_counts = Counter(reference_tokens)
+        
+        all_terms = set(student_counts.keys()) | set(reference_counts.keys())
+        
+        dot_product = sum(student_counts[term] * reference_counts[term] for term in all_terms)
+        
+        student_mag = math.sqrt(sum(count ** 2 for count in student_counts.values()))
+        reference_mag = math.sqrt(sum(count ** 2 for count in reference_counts.values()))
+        
+        if student_mag == 0 or reference_mag == 0:
+            return 0.0
+        
+        return dot_product / (student_mag * reference_mag)
+    
+    @staticmethod
+    def check_key_points(student_text: str, key_points: List[str]) -> tuple:
+        """Check how many key points are present"""
+        if not key_points:
+            return 0, 0, []
+        
+        student_norm = GradingEngine.normalize_text(student_text)
+        found_points = []
+        
+        for point in key_points:
+            point_norm = GradingEngine.normalize_text(point)
+            if point_norm in student_norm or any(term in student_norm for term in point_norm.split()):
+                found_points.append(point)
+        
+        return len(found_points), len(key_points), found_points
+    
+    @staticmethod
+    def evaluate_criterion(student_answer: str, model_answer: str, criterion: RubricCriterion) -> CriterionResult:
+        """Evaluate a single criterion"""
+        
+        student_tokens = GradingEngine.tokenize(student_answer)
+        model_tokens = GradingEngine.tokenize(model_answer)
+        
+        overlap_score = GradingEngine.calculate_overlap(student_tokens, model_tokens)
+        cosine_score = GradingEngine.calculate_cosine_similarity(student_tokens, model_tokens)
+        
+        found_count, total_count, found_points = GradingEngine.check_key_points(
+            student_answer, criterion.key_points
+        )
+        
+        if total_count > 0:
+            key_point_score = found_count / total_count
+        else:
+            key_point_score = (overlap_score + cosine_score) / 2
+        
+        if key_point_score >= 0.8:
+            status = "met"
+            marks = criterion.marks
+        elif key_point_score >= 0.4:
+            status = "partial"
+            marks = max(1, criterion.marks // 2) if criterion.marks > 1 else 0
+        else:
+            status = "not_met"
+            marks = 0
+        
+        justification = GradingEngine.generate_justification(
+            criterion, found_count, total_count, found_points, 
+            key_point_score, status
+        )
+        
+        return CriterionResult(
+            criterion_name=criterion.name,
+            status=status,
+            marks_awarded=marks,
+            marks_total=criterion.marks,
+            justification=justification
+        )
+    
+    @staticmethod
+    def generate_justification(criterion: RubricCriterion, found_count: int, total_count: int, 
+                              found_points: List[str], score: float, status: str) -> str:
+        """Generate human-readable justification"""
+        
+        if status == "met":
+            if total_count > 0:
+                return f"✓ All required elements present ({found_count}/{total_count} key points identified)."
+            return f"✓ Criterion fully satisfied with strong alignment to model answer."
+        
+        elif status == "partial":
+            if total_count > 0:
+                missing = total_count - found_count
+                return f"⚬ Partially satisfied: {found_count}/{total_count} key points present. Missing {missing} element(s)."
+            return f"⚬ Partially satisfied: some relevant content present but incomplete coverage."
+        
+        else:
+            if total_count > 0:
+                return f"✗ Not satisfied: {found_count}/{total_count} key points identified. Missing critical elements."
+            return f"✗ Not satisfied: insufficient alignment with expected answer."
+    
+    @staticmethod
+    def generate_feedback(criterion_results: List[CriterionResult], rubric: List[RubricCriterion]) -> List[str]:
+        """Generate actionable feedback based on results"""
+        
+        feedback = []
+        
+        for result in criterion_results:
+            if result.status == "not_met":
+                criterion = next(c for c in rubric if c.name == result.criterion_name)
+                if criterion.hints:
+                    feedback.append(f"Add {criterion.name.lower()}: {criterion.hints[0]}")
+                else:
+                    feedback.append(f"Include {criterion.name.lower()} in your answer.")
+            
+            elif result.status == "partial":
+                criterion = next(c for c in rubric if c.name == result.criterion_name)
+                if criterion.key_points:
+                    feedback.append(f"Strengthen {criterion.name.lower()}: ensure all required details are covered.")
+                elif criterion.hints:
+                    feedback.append(f"Improve {criterion.name.lower()}: {criterion.hints[0]}")
+        
+        if not feedback:
+            feedback.append("Excellent work! All criteria met.")
+        
+        return feedback[:4]
+    
+    @staticmethod
+    def grade_submission(config: AssessmentConfig, submission: StudentSubmission) -> GradingReport:
+        """Grade a student submission against assessment configuration"""
+        
+        criterion_results = []
+        
+        for criterion in config.rubric:
+            result = GradingEngine.evaluate_criterion(
+                submission.answer,
+                config.model_answer,
+                criterion
+            )
+            criterion_results.append(result)
+        
+        total_score = sum(r.marks_awarded for r in criterion_results)
+        max_score = sum(r.marks_total for r in criterion_results)
+        
+        feedback = GradingEngine.generate_feedback(criterion_results, config.rubric)
+        
+        return GradingReport(
+            criterion_results=criterion_results,
+            total_score=total_score,
+            max_score=max_score,
+            feedback=feedback
+        )
+
+# ============================================================================
+# TRANSLATIONS
+# ============================================================================
+
+TRANSLATIONS = {
+    "en": {
+        "app_title": "Moqayim - Short Answer Grading",
+        "page1_title": "Teacher Setup",
+        "page2_title": "Student Answer",
+        "page3_title": "Grading Results",
+        "question_label": "Question",
+        "model_answer_label": "Model Answer",
+        "rubric_label": "Rubric Criteria",
+        "criterion_name": "Criterion Name",
+        "criterion_marks": "Marks",
+        "key_points": "Key Points (comma-separated, optional)",
+        "hints": "Hints (comma-separated, optional)",
+        "add_criterion": "Add Criterion",
+        "next": "Next →",
+        "submit_answer": "Submit Answer",
+        "view_results": "View Results",
+        "back": "← Back",
+        "reset": "Reset All",
+        "total_score": "Total Score",
+        "feedback": "Feedback",
+        "student_answer_label": "Your Answer",
+        "language": "Language",
+        "upload_document": "Upload Document (PDF or Image)",
+        "extract_text": "Extract Text from Document",
+        "extracted_text": "Extracted Text",
+        "processing": "Processing document...",
+        "upload_hint": "Upload a PDF or image containing the question and model answer"
+    },
+    "ar": {
+        "app_title": "مُقَيِّم - تصحيح الإجابات القصيرة",
+        "page1_title": "إعداد المعلم",
+        "page2_title": "إجابة الطالب",
+        "page3_title": "نتائج التصحيح",
+        "question_label": "السؤال",
+        "model_answer_label": "الإجابة النموذجية",
+        "rubric_label": "معايير التقييم",
+        "criterion_name": "اسم المعيار",
+        "criterion_marks": "الدرجات",
+        "key_points": "النقاط الرئيسية (مفصولة بفواصل، اختياري)",
+        "hints": "التلميحات (مفصولة بفواصل، اختياري)",
+        "add_criterion": "إضافة معيار",
+        "next": "التالي ←",
+        "submit_answer": "إرسال الإجابة",
+        "view_results": "عرض النتائج",
+        "back": "→ رجوع",
+        "reset": "إعادة تعيين",
+        "total_score": "الدرجة الإجمالية",
+        "feedback": "التغذية الراجعة",
+        "student_answer_label": "إجابتك",
+        "language": "اللغة",
+        "upload_document": "تحميل مستند (PDF أو صورة)",
+        "extract_text": "استخراج النص من المستند",
+        "extracted_text": "النص المستخرج",
+        "processing": "معالجة المستند...",
+        "upload_hint": "قم بتحميل PDF أو صورة تحتوي على السؤال والإجابة النموذجية"
     }
 }
 
-# Get Streamlit URL from environment or use default
-STREAMLIT_URL = os.environ.get('STREAMLIT_URL', 'https://mogayim.streamlit.app')
+def t(key: str, lang: str = "en") -> str:
+    """Get translation"""
+    return TRANSLATIONS.get(lang, TRANSLATIONS["en"]).get(key, key)
 
-def verify_lti_request(request_data, consumer_secret):
-    """Verify LTI OAuth signature (simplified for basic validation)"""
-    # For production, you should use a proper OAuth library
-    # This is a simplified version for basic LTI 1.1
-    oauth_signature = request_data.get('oauth_signature', '')
-    return True  # For now, accept all requests. TODO: Implement proper OAuth validation
+# ============================================================================
+# LTI VALIDATION
+# ============================================================================
 
-@app.route('/')
-def home():
-    return "✅ Moqayim LTI Server is running!", 200
-
-@app.route('/lti/config', methods=['GET'])
-def lti_config():
-    """LTI configuration XML for Blackboard"""
-    base_url = request.host_url.rstrip('/')
-    
-    # This XML tells Blackboard to open in a new window, not iframe
-    config_xml = f'''<?xml version="1.0" encoding="UTF-8"?>
-<cartridge_basiclti_link xmlns="http://www.imsglobal.org/xsd/imslticc_v1p0"
-    xmlns:blti="http://www.imsglobal.org/xsd/imsbasiclti_v1p0"
-    xmlns:lticm="http://www.imsglobal.org/xsd/imslticm_v1p0"
-    xmlns:lticp="http://www.imsglobal.org/xsd/imslticp_v1p0"
-    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-    xsi:schemaLocation="http://www.imsglobal.org/xsd/imslticc_v1p0 http://www.imsglobal.org/xsd/lti/ltiv1p0/imslticc_v1p0.xsd
-    http://www.imsglobal.org/xsd/imsbasiclti_v1p0 http://www.imsglobal.org/xsd/lti/ltiv1p0/imsbasiclti_v1p0p1.xsd
-    http://www.imsglobal.org/xsd/imslticm_v1p0 http://www.imsglobal.org/xsd/lti/ltiv1p0/imslticm_v1p0.xsd
-    http://www.imsglobal.org/xsd/imslticp_v1p0 http://www.imsglobal.org/xsd/lti/ltiv1p0/imslticp_v1p0.xsd">
-    <blti:title>Moqayim Grading Tool</blti:title>
-    <blti:description>AI-powered short answer grading tool for instructors and students</blti:description>
-    <blti:launch_url>{base_url}/lti/launch</blti:launch_url>
-    <blti:secure_launch_url>{base_url}/lti/launch</blti:secure_launch_url>
-    <blti:icon>{base_url}/static/icon.png</blti:icon>
-    <blti:vendor>
-        <lticp:code>moqayim</lticp:code>
-        <lticp:name>Moqayim</lticp:name>
-        <lticp:description>AI-powered grading assistance</lticp:description>
-    </blti:vendor>
-    <blti:custom>
-        <lticm:property name="launch_presentation_return_url">$ToolConsumerProfile.url</lticm:property>
-    </blti:custom>
-    <cartridge_bundle identifierref="BLTI001_Bundle"/>
-    <cartridge_icon identifierref="BLTI001_Icon"/>
-</cartridge_basiclti_link>'''
-    
-    response = make_response(config_xml)
-    response.headers['Content-Type'] = 'application/xml'
-    response.headers['Content-Disposition'] = 'attachment; filename=moqayim_lti_config.xml'
-    return response
-
-@app.route('/lti/launch', methods=['POST', 'GET'])
-def lti_launch():
-    """Receive LTI launch from Blackboard"""
-    
+def validate_lti_request(request_data):
+    """Validate LTI 1.1 launch request"""
     try:
-        # For testing with GET
-        if request.method == 'GET':
-            test_html = '''
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <title>Moqayim LTI Test</title>
-                <style>
-                    body { font-family: Arial; padding: 40px; background: #f5f5f5; }
-                    .container { max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-                    h2 { color: #667eea; }
-                    .status { padding: 15px; background: #e3f2fd; border-left: 4px solid #2196f3; margin: 20px 0; }
-                    .info { background: #f5f5f5; padding: 15px; border-radius: 5px; margin: 10px 0; }
-                    code { background: #f5f5f5; padding: 2px 6px; border-radius: 3px; }
-                </style>
-            </head>
-            <body>
-                <div class="container">
-                    <h2>✅ Moqayim LTI Endpoint is Active</h2>
-                    <div class="status">
-                        <strong>Status:</strong> Ready to receive LTI launches from Blackboard
-                    </div>
-                    <div class="info">
-                        <p><strong>Configuration:</strong></p>
-                        <ul>
-                            <li>Launch URL: <code>''' + request.host_url.rstrip('/') + '''/lti/launch</code></li>
-                            <li>Tool Provider Key: <code>moqayim_key</code></li>
-                            <li>Tool Provider Secret: <code>moqayim_secret</code></li>
-                            <li>Target App: <code>''' + STREAMLIT_URL + '''</code></li>
-                        </ul>
-                    </div>
-                    <p>This endpoint expects POST requests from Blackboard with LTI parameters.</p>
-                </div>
-            </body>
-            </html>
-            '''
-            return test_html, 200
+        # Simple validation - check for required parameters
+        required_params = ['oauth_consumer_key', 'user_id', 'roles']
         
-        # Log all received parameters for debugging
-        print("\n" + "="*60)
-        print("📥 LTI LAUNCH REQUEST RECEIVED")
-        print("="*60)
-        print("Method:", request.method)
-        print("Headers:", dict(request.headers))
-        print("\nForm Data:")
-        for key, value in request.form.items():
-            print(f"   {key}: {value}")
-        print("="*60 + "\n")
+        for param in required_params:
+            if param not in request_data:
+                return False, f"Missing required parameter: {param}"
         
-        # Extract LTI parameters
-        oauth_consumer_key = request.form.get('oauth_consumer_key', '')
-        user_id = request.form.get('user_id', request.form.get('lis_person_sourcedid', 'demo_user'))
-        roles = request.form.get('roles', 'Student')
-        course_id = request.form.get('context_id', 'demo_course')
-        course_title = request.form.get('context_title', 'Course')
-        assignment_id = request.form.get('resource_link_id', 'demo_assignment')
-        assignment_title = request.form.get('resource_link_title', 'Assignment')
-        user_email = request.form.get('lis_person_contact_email_primary', '')
-        user_name = request.form.get('lis_person_name_full', user_id)
+        # Validate consumer key
+        if request_data.get('oauth_consumer_key') != LTI_CONSUMER_KEY:
+            return False, "Invalid consumer key"
         
-        # Verify consumer key
-        if oauth_consumer_key and oauth_consumer_key not in CONSUMERS:
-            print(f"❌ Invalid consumer key: {oauth_consumer_key}")
-            return "Invalid consumer key", 403
+        # For prototype, skip full OAuth signature validation
+        # In production, you'd validate oauth_signature using HMAC-SHA1
         
-        if oauth_consumer_key:
-            consumer_secret = CONSUMERS[oauth_consumer_key]['secret']
-            # In production, verify OAuth signature here
-            # verify_lti_request(request.form, consumer_secret)
-        
-        print(f"✅ LTI Parameters:")
-        print(f"   User: {user_name} ({user_id})")
-        print(f"   Email: {user_email}")
-        print(f"   Role: {roles}")
-        print(f"   Course: {course_title} ({course_id})")
-        print(f"   Assignment: {assignment_title} ({assignment_id})")
-        
-        # Determine if instructor or student
-        is_instructor = any(role in roles for role in ['Instructor', 'Administrator', 'ContentDeveloper', 'TeachingAssistant'])
-        role = 'instructor' if is_instructor else 'student'
-        
-        # Create session with all metadata
-        session_id = secrets.token_urlsafe(16)
-        session_metadata = {
-            'user_name': user_name,
-            'user_email': user_email,
-            'course_title': course_title,
-            'assignment_title': assignment_title,
-            'roles': roles
-        }
-        save_session(session_id, user_id, role, course_id, assignment_id, session_metadata)
-        
-        print(f"✅ Session created: {session_id}")
-        print(f"   Role: {role}")
-        
-        # Build Streamlit URL with session
-        streamlit_url = f"{STREAMLIT_URL}?session={session_id}&role={role}"
-        
-        # Return HTML that forces a full-page redirect (not iframe)
-        return render_template_string('''
+        return True, "Valid"
+    
+    except Exception as e:
+        return False, str(e)
+
+# ============================================================================
+# HTML TEMPLATES
+# ============================================================================
+
+BASE_TEMPLATE = """
 <!DOCTYPE html>
-<html>
+<html lang="{{ 'ar' if lang == 'ar' else 'en' }}" dir="{{ 'rtl' if lang == 'ar' else 'ltr' }}">
 <head>
     <meta charset="UTF-8">
-    <title>Launching Moqayim...</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ t('app_title', lang) }}</title>
     <style>
         * {
             margin: 0;
             padding: 0;
             box-sizing: border-box;
         }
+        
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
-            display: flex;
-            justify-content: center;
-            align-items: center;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        
+        .header h1 {
+            font-size: 28px;
+            font-weight: 700;
+        }
+        
+        .header-controls {
+            display: flex;
+            gap: 10px;
+        }
+        
+        .content {
+            padding: 40px;
+        }
+        
+        .form-group {
+            margin-bottom: 25px;
+        }
+        
+        label {
+            display: block;
+            font-weight: 600;
+            margin-bottom: 8px;
+            color: #333;
+            font-size: 14px;
+        }
+        
+        input[type="text"],
+        input[type="number"],
+        textarea,
+        select {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 15px;
+            font-family: inherit;
+            transition: border-color 0.3s;
+        }
+        
+        input[type="text"]:focus,
+        input[type="number"]:focus,
+        textarea:focus,
+        select:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        
+        textarea {
+            resize: vertical;
+            min-height: 120px;
+        }
+        
+        .btn {
+            padding: 12px 24px;
+            border: none;
+            border-radius: 8px;
+            font-size: 15px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+            text-decoration: none;
+            display: inline-block;
+        }
+        
+        .btn-primary {
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             color: white;
         }
-        .container {
-            text-align: center;
-            padding: 60px 40px;
-            background: rgba(255, 255, 255, 0.15);
-            border-radius: 24px;
-            backdrop-filter: blur(12px);
-            max-width: 550px;
-            box-shadow: 0 8px 32px rgba(0,0,0,0.25);
-            animation: fadeIn 0.5s ease-in;
+        
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
         }
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(-20px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-        h1 {
-            font-size: 32px;
-            margin-bottom: 10px;
-            font-weight: 600;
-        }
-        .subtitle {
-            font-size: 16px;
-            opacity: 0.9;
-            margin-bottom: 30px;
-        }
-        .spinner {
-            border: 5px solid rgba(255, 255, 255, 0.25);
-            border-radius: 50%;
-            border-top: 5px solid white;
-            width: 60px;
-            height: 60px;
-            animation: spin 1s linear infinite;
-            margin: 30px auto;
-        }
-        @keyframes spin {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
-        }
-        .status {
-            font-size: 16px;
-            margin: 25px 0;
-            font-weight: 500;
-        }
-        .launch-button {
-            display: inline-block;
-            margin-top: 30px;
-            padding: 16px 45px;
-            background: #ffd700;
+        
+        .btn-secondary {
+            background: #e0e0e0;
             color: #333;
-            text-decoration: none;
-            font-weight: 700;
-            font-size: 17px;
-            border-radius: 30px;
-            transition: all 0.3s ease;
-            box-shadow: 0 4px 15px rgba(0,0,0,0.2);
-            border: none;
+        }
+        
+        .btn-secondary:hover {
+            background: #d0d0d0;
+        }
+        
+        .btn-success {
+            background: #10b981;
+            color: white;
+        }
+        
+        .btn-danger {
+            background: #ef4444;
+            color: white;
+        }
+        
+        .btn-group {
+            display: flex;
+            gap: 10px;
+            margin-top: 30px;
+            flex-wrap: wrap;
+        }
+        
+        .criterion-card {
+            background: #f9fafb;
+            border: 2px solid #e5e7eb;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 15px;
+        }
+        
+        .criterion-header {
+            display: grid;
+            grid-template-columns: 3fr 1fr;
+            gap: 15px;
+            margin-bottom: 15px;
+        }
+        
+        .alert {
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+        
+        .alert-info {
+            background: #dbeafe;
+            border-left: 4px solid #3b82f6;
+            color: #1e40af;
+        }
+        
+        .alert-success {
+            background: #d1fae5;
+            border-left: 4px solid #10b981;
+            color: #065f46;
+        }
+        
+        .alert-error {
+            background: #fee2e2;
+            border-left: 4px solid #ef4444;
+            color: #991b1b;
+        }
+        
+        .alert-warning {
+            background: #fef3c7;
+            border-left: 4px solid #f59e0b;
+            color: #92400e;
+        }
+        
+        .file-upload {
+            border: 2px dashed #d1d5db;
+            border-radius: 8px;
+            padding: 30px;
+            text-align: center;
+            background: #f9fafb;
             cursor: pointer;
+            transition: all 0.3s;
+        }
+        
+        .file-upload:hover {
+            border-color: #667eea;
+            background: #f3f4f6;
+        }
+        
+        .file-upload input[type="file"] {
             display: none;
         }
-        .launch-button:hover {
-            background: #ffed4e;
-            transform: translateY(-3px);
-            box-shadow: 0 6px 25px rgba(0,0,0,0.3);
-        }
-        .info {
-            font-size: 12px;
-            margin-top: 30px;
-            padding: 20px;
-            background: rgba(255, 255, 255, 0.1);
+        
+        .score-card {
+            background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+            color: white;
+            padding: 30px;
             border-radius: 12px;
-            line-height: 1.6;
+            text-align: center;
+            margin-bottom: 30px;
         }
-        .info-item {
-            margin: 8px 0;
+        
+        .score-card h2 {
+            font-size: 48px;
+            margin-bottom: 10px;
         }
-        code {
-            background: rgba(0,0,0,0.2);
-            padding: 2px 8px;
+        
+        .score-card p {
+            font-size: 18px;
+            opacity: 0.9;
+        }
+        
+        .result-card {
+            border: 2px solid #e5e7eb;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 15px;
+        }
+        
+        .result-card.met {
+            border-left: 4px solid #10b981;
+            background: #f0fdf4;
+        }
+        
+        .result-card.partial {
+            border-left: 4px solid #f59e0b;
+            background: #fffbeb;
+        }
+        
+        .result-card.not_met {
+            border-left: 4px solid #ef4444;
+            background: #fef2f2;
+        }
+        
+        .result-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        
+        .result-title {
+            font-weight: 700;
+            font-size: 16px;
+        }
+        
+        .result-score {
+            font-weight: 700;
+            font-size: 18px;
+        }
+        
+        .feedback-list {
+            list-style: none;
+            padding: 0;
+        }
+        
+        .feedback-list li {
+            padding: 12px;
+            background: #f9fafb;
+            border-left: 3px solid #667eea;
+            margin-bottom: 10px;
             border-radius: 4px;
-            font-family: 'Courier New', monospace;
-            font-size: 11px;
+        }
+        
+        .divider {
+            height: 2px;
+            background: #e5e7eb;
+            margin: 30px 0;
+        }
+        
+        .lti-banner {
+            background: #eff6ff;
+            border-left: 4px solid #3b82f6;
+            padding: 15px;
+            margin-bottom: 20px;
+            border-radius: 4px;
+        }
+        
+        @media (max-width: 768px) {
+            .header {
+                flex-direction: column;
+                align-items: flex-start;
+            }
+            
+            .header-controls {
+                margin-top: 15px;
+                width: 100%;
+            }
+            
+            .criterion-header {
+                grid-template-columns: 1fr;
+            }
+            
+            .btn-group {
+                flex-direction: column;
+            }
+            
+            .btn {
+                width: 100%;
+            }
         }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>🚀 Launching Moqayim</h1>
-        <p class="subtitle">AI-Powered Grading Assistant</p>
-        <div class="spinner"></div>
-        <div class="status" id="status">Connecting to your session...</div>
-        <button class="launch-button" id="launchBtn" onclick="launchApp()">
-            Launch Moqayim Now
-        </button>
-        <div class="info">
-            <div class="info-item"><strong>User:</strong> {{ user_name }}</div>
-            <div class="info-item"><strong>Role:</strong> {{ role|upper }}</div>
-            <div class="info-item"><strong>Session:</strong> <code>{{ session }}</code></div>
+        <div class="header">
+            <h1>{{ t('app_title', lang) }}</h1>
+            <div class="header-controls">
+                <form method="GET" style="display: inline;">
+                    <select name="lang" onchange="this.form.submit()" class="btn btn-secondary" style="padding: 8px 16px;">
+                        <option value="en" {{ 'selected' if lang == 'en' else '' }}>English</option>
+                        <option value="ar" {{ 'selected' if lang == 'ar' else '' }}>العربية</option>
+                    </select>
+                </form>
+                <a href="{{ url_for('reset') }}" class="btn btn-secondary">{{ t('reset', lang) }}</a>
+            </div>
+        </div>
+        
+        <div class="content">
+            {% if lti_user %}
+            <div class="lti-banner">
+                🔗 Connected via LTI | Role: {{ lti_role }} | User: {{ lti_user }}
+            </div>
+            {% endif %}
+            
+            {% with messages = get_flashed_messages(with_categories=true) %}
+                {% if messages %}
+                    {% for category, message in messages %}
+                        <div class="alert alert-{{ category }}">{{ message }}</div>
+                    {% endfor %}
+                {% endif %}
+            {% endwith %}
+            
+            {% block content %}{% endblock %}
         </div>
     </div>
-    
-    <script>
-        const TARGET_URL = {{ url|tojson }};
-        let redirectAttempted = false;
-        
-        function updateStatus(message, showButton = false) {
-            const statusEl = document.getElementById('status');
-            const buttonEl = document.getElementById('launchBtn');
-            const spinnerEl = document.querySelector('.spinner');
-            
-            statusEl.textContent = message;
-            
-            if (showButton) {
-                buttonEl.style.display = 'inline-block';
-                spinnerEl.style.display = 'none';
-            }
-        }
-        
-        function launchApp() {
-            if (redirectAttempted) return;
-            redirectAttempted = true;
-            
-            try {
-                // Method 1: Try to break out of iframe
-                if (window.top && window.top !== window.self) {
-                    console.log('In iframe - attempting to redirect parent');
-                    updateStatus('Opening in main window...');
-                    window.top.location.replace(TARGET_URL);
-                    return;
-                }
-                
-                // Method 2: Direct redirect
-                console.log('Direct redirect');
-                updateStatus('Redirecting now...');
-                window.location.replace(TARGET_URL);
-                
-            } catch (error) {
-                console.error('Redirect failed:', error);
-                
-                // Method 3: Open in new window
-                updateStatus('Opening in new window...');
-                const newWindow = window.open(TARGET_URL, '_blank', 'noopener,noreferrer');
-                
-                if (newWindow) {
-                    updateStatus('✅ Opened successfully!', false);
-                    setTimeout(() => {
-                        updateStatus('You can close this window', false);
-                    }, 2000);
-                } else {
-                    // Popup blocked - show button
-                    updateStatus('⚠️ Please click the button below:', true);
-                }
-            }
-        }
-        
-        // Automatic launch after 1 second
-        setTimeout(() => {
-            updateStatus('Launching now...');
-            launchApp();
-        }, 1000);
-        
-        // Show manual button after 4 seconds if still here
-        setTimeout(() => {
-            if (!redirectAttempted || window.location.href.indexOf('moqayim') === -1) {
-                updateStatus('Click below to launch:', true);
-            }
-        }, 4000);
-        
-        // Prevent browser back button issues
-        window.history.pushState(null, '', window.location.href);
-        window.addEventListener('popstate', function() {
-            window.history.pushState(null, '', window.location.href);
-        });
-    </script>
 </body>
 </html>
-        ''', 
-        url=streamlit_url, 
-        session=session_id, 
-        role=role,
-        user_name=user_name), 200
-        
-    except Exception as e:
-        print(f"❌ ERROR in LTI launch: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        
-        return render_template_string('''
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Error</title>
-            <style>
-                body { font-family: Arial; padding: 40px; background: #f5f5f5; }
-                .error { max-width: 600px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; border-left: 4px solid #f44336; }
-                h2 { color: #f44336; }
-                pre { background: #f5f5f5; padding: 15px; border-radius: 5px; overflow-x: auto; }
-            </style>
-        </head>
-        <body>
-            <div class="error">
-                <h2>⚠️ Launch Error</h2>
-                <p>There was an error launching Moqayim:</p>
-                <pre>{{ error }}</pre>
-                <p>Please contact your administrator or try again.</p>
-            </div>
-        </body>
-        </html>
-        ''', error=str(e)), 500
+"""
 
-@app.route('/api/session/<session_id>', methods=['GET'])
-def api_get_session(session_id):
-    """API endpoint for Streamlit to fetch session"""
-    try:
-        session_data = get_session(session_id)
-        if session_data:
-            print(f"✅ Session fetched: {session_id}")
-            return jsonify(session_data), 200
-        print(f"❌ Session not found: {session_id}")
-        return jsonify({'error': 'Session not found'}), 404
-    except Exception as e:
-        print(f"❌ Error fetching session: {str(e)}")
-        return jsonify({'error': str(e)}), 500
+PAGE1_TEMPLATE = BASE_TEMPLATE + """
+{% block content %}
+<h2 style="margin-bottom: 25px;">{{ t('page1_title', lang) }}</h2>
 
-@app.route('/lti/grade', methods=['POST'])
-def grade_passback():
-    """Receive grades from Streamlit and send back to Blackboard"""
-    try:
-        data = request.json
-        print(f"📊 Grade passback received: {data}")
-        # TODO: Implement actual grade passback to Blackboard
-        return jsonify({'status': 'success', 'message': 'Grade received'}), 200
-    except Exception as e:
-        print(f"❌ Grade passback error: {str(e)}")
-        return jsonify({'status': 'error', 'message': str(e)}), 500
-
-@app.route('/health', methods=['GET'])
-def health():
-    """Health check endpoint"""
-    return jsonify({
-        'status': 'healthy', 
-        'app': 'moqayim-lti',
-        'streamlit_url': STREAMLIT_URL,
-        'version': '2.0'
-    }), 200
-
-@app.route('/test-redirect')
-def test_redirect():
-    """Test the redirect functionality"""
-    test_session = secrets.token_urlsafe(16)
-    streamlit_url = f"{STREAMLIT_URL}?session={test_session}&role=instructor"
+<form method="POST" enctype="multipart/form-data">
     
-    return render_template_string('''
-    <!DOCTYPE html>
-    <html>
-    <head><title>Testing Redirect</title></head>
-    <body style="font-family: Arial; padding: 40px;">
-        <h2>Testing Redirect to Moqayim</h2>
-        <p>Target URL: <code>{{ url }}</code></p>
-        <button onclick="window.open('{{ url }}', '_blank')">Open in New Tab</button>
-        <button onclick="window.location.href='{{ url }}'">Redirect Current Tab</button>
-        <script>
-            setTimeout(() => {
-                console.log('Auto-redirecting...');
-                window.location.href = '{{ url }}';
-            }, 2000);
-        </script>
-    </body>
-    </html>
-    ''', url=streamlit_url)
+    {% if not groq_available %}
+    <div class="alert alert-warning">
+        ⚠️ Groq library is not installed. OCR features will be disabled.
+    </div>
+    {% elif not groq_api_key %}
+    <div class="alert alert-warning">
+        ⚠️ Please set your GROQ_API_KEY environment variable to use OCR features.
+    </div>
+    {% endif %}
+    
+    <div class="divider"></div>
+    
+    <h3 style="margin-bottom: 15px;">📄 {{ t('upload_document', lang) }}</h3>
+    <p style="color: #666; margin-bottom: 15px; font-size: 14px;">{{ t('upload_hint', lang) }}</p>
+    
+    <div class="form-group">
+        <label class="file-upload">
+            <input type="file" name="document" accept=".pdf,.png,.jpg,.jpeg" onchange="this.form.submit()">
+            <div style="font-size: 48px; margin-bottom: 10px;">📤</div>
+            <div style="font-weight: 600; color: #667eea;">Click to upload PDF or Image</div>
+            <div style="font-size: 13px; color: #666; margin-top: 5px;">Supports PDF, PNG, JPG, JPEG</div>
+        </label>
+    </div>
+    
+    {% if extracted_text %}
+    <div class="alert alert-success">
+        ✓ Text extracted and fields auto-filled!
+    </div>
+    <details style="margin-bottom: 20px;">
+        <summary style="cursor: pointer; font-weight: 600; padding: 10px; background: #f9fafb; border-radius: 4px;">
+            📝 {{ t('extracted_text', lang) }}
+        </summary>
+        <textarea readonly style="margin-top: 10px; background: #f9fafb; font-family: monospace; font-size: 13px;">{{ extracted_text }}</textarea>
+    </details>
+    {% endif %}
+    
+    <div class="divider"></div>
+    
+    <div class="form-group">
+        <label>{{ t('question_label', lang) }}</label>
+        <textarea name="question" placeholder="e.g., Explain the process of photosynthesis." required>{{ question or '' }}</textarea>
+    </div>
+    
+    <div class="form-group">
+        <label>{{ t('model_answer_label', lang) }}</label>
+        <textarea name="model_answer" style="min-height: 150px;" placeholder="e.g., Photosynthesis is the process by which plants convert light energy into chemical energy..." required>{{ model_answer or '' }}</textarea>
+    </div>
+    
+    <div class="divider"></div>
+    
+    <h3 style="margin-bottom: 20px;">{{ t('rubric_label', lang) }}</h3>
+    
+    {% for i in range(num_criteria) %}
+    <div class="criterion-card">
+        <div class="criterion-header">
+            <div class="form-group" style="margin-bottom: 0;">
+                <label>{{ t('criterion_name', lang) }} {{ i + 1 }}</label>
+                <input type="text" name="criterion_name_{{ i }}" placeholder="e.g., Definition" required>
+            </div>
+            <div class="form-group" style="margin-bottom: 0;">
+                <label>{{ t('criterion_marks', lang) }}</label>
+                <input type="number" name="criterion_marks_{{ i }}" min="1" max="10" value="2" required>
+            </div>
+        </div>
+        <div class="form-group" style="margin-bottom: 10px;">
+            <label>{{ t('key_points', lang) }}</label>
+            <input type="text" name="criterion_kp_{{ i }}" placeholder="e.g., light energy, chemical energy, glucose">
+        </div>
+        <div class="form-group" style="margin-bottom: 0;">
+            <label>{{ t('hints', lang) }}</label>
+            <input type="text" name="criterion_hints_{{ i }}" placeholder="e.g., Include the chemical equation">
+        </div>
+    </div>
+    {% endfor %}
+    
+    <button type="submit" name="add_criterion" value="1" class="btn btn-secondary">{{ t('add_criterion', lang) }}</button>
+    
+    <div class="btn-group">
+        <button type="submit" class="btn btn-primary">{{ t('next', lang) }}</button>
+    </div>
+</form>
+{% endblock %}
+"""
+
+PAGE2_TEMPLATE = BASE_TEMPLATE + """
+{% block content %}
+<h2 style="margin-bottom: 25px;">{{ t('page2_title', lang) }}</h2>
+
+<div class="alert alert-info">
+    <strong>{{ t('question_label', lang) }}</strong><br>
+    {{ question }}
+</div>
+
+<div class="divider"></div>
+
+<form method="POST" enctype="multipart/form-data">
+    
+    <h3 style="margin-bottom: 15px;">📄 {{ t('upload_document', lang) }}</h3>
+    <p style="color: #666; margin-bottom: 15px; font-size: 14px;">Upload a scanned document or image of the student's handwritten answer</p>
+    
+    <div class="form-group">
+        <label class="file-upload">
+            <input type="file" name="student_document" accept=".pdf,.png,.jpg,.jpeg" onchange="this.form.submit()">
+            <div style="font-size: 48px; margin-bottom: 10px;">📤</div>
+            <div style="font-weight: 600; color: #667eea;">Click to upload PDF or Image</div>
+            <div style="font-size: 13px; color: #666; margin-top: 5px;">Supports PDF, PNG, JPG, JPEG</div>
+        </label>
+    </div>
+    
+    {% if student_extracted_text %}
+    <div class="alert alert-success">
+        ✓ Student answer extracted and auto-filled!
+    </div>
+    <details style="margin-bottom: 20px;">
+        <summary style="cursor: pointer; font-weight: 600; padding: 10px; background: #f9fafb; border-radius: 4px;">
+            📝 {{ t('extracted_text', lang) }}
+        </summary>
+        <textarea readonly style="margin-top: 10px; background: #f9fafb; font-family: monospace; font-size: 13px;">{{ student_extracted_text }}</textarea>
+    </details>
+    {% endif %}
+    
+    <div class="divider"></div>
+    
+    <div class="form-group">
+        <label>{{ t('student_answer_label', lang) }}</label>
+        <textarea name="student_answer" style="min-height: 200px;" placeholder="Type your answer here..." required>{{ student_answer or '' }}</textarea>
+    </div>
+    
+    <div class="btn-group">
+        <a href="{{ url_for('page1') }}" class="btn btn-secondary">{{ t('back', lang) }}</a>
+        <button type="submit" class="btn btn-primary">{{ t('submit_answer', lang) }}</button>
+    </div>
+</form>
+{% endblock %}
+"""
+
+PAGE3_TEMPLATE = BASE_TEMPLATE + """
+{% block content %}
+<h2 style="margin-bottom: 25px;">{{ t('page3_title', lang) }}</h2>
+
+<div class="score-card">
+    <h2>{{ total_score }}/{{ max_score }}</h2>
+    <p>{{ t('total_score', lang) }} • {{ '%.1f'|format(percentage) }}%</p>
+</div>
+
+<h3 style="margin-bottom: 15px;">Criterion Breakdown</h3>
+
+{% for result in criterion_results %}
+<div class="result-card {{ result.status }}">
+    <div class="result-header">
+        <div class="result-title">
+            {% if result.status == 'met' %}🟢
+            {% elif result.status == 'partial' %}🟡
+            {% else %}🔴{% endif %}
+            {{ result.criterion_name }}
+        </div>
+        <div class="result-score">{{ result.marks_awarded }}/{{ result.marks_total }}</div>
+    </div>
+    <div style="color: #666; font-size: 14px;">{{ result.justification }}</div>
+</div>
+{% endfor %}
+
+<div class="divider"></div>
+
+<h3 style="margin-bottom: 15px;">{{ t('feedback', lang) }}</h3>
+<ul class="feedback-list">
+    {% for fb in feedback %}
+    <li>{{ loop.index }}. {{ fb }}</li>
+    {% endfor %}
+</ul>
+
+<details style="margin-top: 30px;">
+    <summary style="cursor: pointer; font-weight: 600; padding: 10px; background: #f9fafb; border-radius: 4px;">
+        View Student Answer
+    </summary>
+    <div style="margin-top: 15px; padding: 15px; background: #f9fafb; border-radius: 4px; white-space: pre-wrap;">{{ student_answer }}</div>
+</details>
+
+<div class="btn-group">
+    <a href="{{ url_for('page2') }}" class="btn btn-secondary">{{ t('back', lang) }}</a>
+    <a href="{{ url_for('reset') }}" class="btn btn-danger">{{ t('reset', lang) }}</a>
+</div>
+{% endblock %}
+"""
+
+# ============================================================================
+# FLASK ROUTES
+# ============================================================================
+
+@app.route('/lti/launch', methods=['POST'])
+def lti_launch():
+    """Handle LTI launch from Blackboard"""
+    
+    # Validate LTI request
+    is_valid, message = validate_lti_request(request.form)
+    
+    if not is_valid:
+        return f"LTI Launch Failed: {message}", 403
+    
+    # Store LTI session data
+    session.permanent = True
+    session['lti_valid'] = True
+    session['lti_user_id'] = request.form.get('user_id')
+    session['lti_user_name'] = request.form.get('lis_person_name_full', 'User')
+    session['lti_role'] = 'teacher' if 'Instructor' in request.form.get('roles', '') else 'student'
+    session['lti_course_id'] = request.form.get('context_id', 'unknown')
+    session['lti_course_name'] = request.form.get('context_title', 'Unknown Course')
+    
+    # Redirect to appropriate page based on role
+    return redirect(url_for('page1'))
+
+@app.route('/')
+def index():
+    """Redirect to page 1"""
+    return redirect(url_for('page1'))
+
+@app.route('/page1', methods=['GET', 'POST'])
+def page1():
+    """Teacher setup page"""
+    lang = request.args.get('lang', session.get('language', 'en'))
+    session['language'] = lang
+    
+    if request.method == 'POST':
+        # Handle file upload
+        if 'document' in request.files and request.files['document'].filename:
+            file = request.files['document']
+            try:
+                extracted_text = DocumentProcessor.process_uploaded_file(file, lang, GROQ_API_KEY)
+                question, answer = DocumentProcessor.smart_split_qa(extracted_text)
+                session['extracted_question'] = question
+                session['extracted_answer'] = answer
+                session['extracted_text'] = extracted_text
+                return redirect(url_for('page1', lang=lang))
+            except Exception as e:
+                return render_template_string(
+                    PAGE1_TEMPLATE,
+                    lang=lang,
+                    t=t,
+                    num_criteria=session.get('num_criteria', 3),
+                    error=str(e),
+                    groq_available=GROQ_AVAILABLE,
+                    groq_api_key=GROQ_API_KEY,
+                    lti_user=session.get('lti_user_name'),
+                    lti_role=session.get('lti_role')
+                )
+        
+        # Handle add criterion
+        if request.form.get('add_criterion'):
+            session['num_criteria'] = session.get('num_criteria', 3) + 1
+            return redirect(url_for('page1', lang=lang))
+        
+        # Handle form submission
+        question = request.form.get('question')
+        model_answer = request.form.get('model_answer')
+        num_criteria = session.get('num_criteria', 3)
+        
+        rubric = []
+        for i in range(num_criteria):
+            name = request.form.get(f'criterion_name_{i}')
+            if name:
+                marks = int(request.form.get(f'criterion_marks_{i}', 2))
+                key_points_str = request.form.get(f'criterion_kp_{i}', '')
+                hints_str = request.form.get(f'criterion_hints_{i}', '')
+                
+                key_points = [kp.strip() for kp in key_points_str.split(",") if kp.strip()]
+                hints = [h.strip() for h in hints_str.split(",") if h.strip()]
+                
+                rubric.append({
+                    'name': name,
+                    'marks': marks,
+                    'key_points': key_points,
+                    'hints': hints
+                })
+        
+        if not question or not model_answer or len(rubric) == 0:
+            return render_template_string(
+                PAGE1_TEMPLATE,
+                lang=lang,
+                t=t,
+                num_criteria=num_criteria,
+                error="Please fill in all required fields.",
+                groq_available=GROQ_AVAILABLE,
+                groq_api_key=GROQ_API_KEY,
+                lti_user=session.get('lti_user_name'),
+                lti_role=session.get('lti_role')
+            )
+        
+        session['assessment_config'] = {
+            'question': question,
+            'model_answer': model_answer,
+            'rubric': rubric,
+            'language': lang
+        }
+        
+        return redirect(url_for('page2', lang=lang))
+    
+    # GET request
+    return render_template_string(
+        PAGE1_TEMPLATE,
+        lang=lang,
+        t=t,
+        num_criteria=session.get('num_criteria', 3),
+        question=session.get('extracted_question', ''),
+        model_answer=session.get('extracted_answer', ''),
+        extracted_text=session.get('extracted_text', ''),
+        groq_available=GROQ_AVAILABLE,
+        groq_api_key=GROQ_API_KEY,
+        lti_user=session.get('lti_user_name'),
+        lti_role=session.get('lti_role')
+    )
+
+@app.route('/page2', methods=['GET', 'POST'])
+def page2():
+    """Student answer page"""
+    lang = request.args.get('lang', session.get('language', 'en'))
+    
+    if 'assessment_config' not in session:
+        return redirect(url_for('page1', lang=lang))
+    
+    config = session['assessment_config']
+    
+    if request.method == 'POST':
+        # Handle file upload
+        if 'student_document' in request.files and request.files['student_document'].filename:
+            file = request.files['student_document']
+            try:
+                extracted_text = DocumentProcessor.process_uploaded_file(file, lang, GROQ_API_KEY)
+                session['student_extracted_answer'] = extracted_text
+                session['student_extracted_text'] = extracted_text
+                return redirect(url_for('page2', lang=lang))
+            except Exception as e:
+                return render_template_string(
+                    PAGE2_TEMPLATE,
+                    lang=lang,
+                    t=t,
+                    question=config['question'],
+                    error=str(e),
+                    lti_user=session.get('lti_user_name'),
+                    lti_role=session.get('lti_role')
+                )
+        
+        # Handle answer submission
+        student_answer = request.form.get('student_answer')
+        
+        if not student_answer or not student_answer.strip():
+            return render_template_string(
+                PAGE2_TEMPLATE,
+                lang=lang,
+                t=t,
+                question=config['question'],
+                error="Please provide an answer.",
+                lti_user=session.get('lti_user_name'),
+                lti_role=session.get('lti_role')
+            )
+        
+        # Create assessment objects
+        rubric = [
+            RubricCriterion(
+                name=c['name'],
+                marks=c['marks'],
+                key_points=c['key_points'],
+                hints=c['hints']
+            ) for c in config['rubric']
+        ]
+        
+        assessment = AssessmentConfig(
+            question=config['question'],
+            model_answer=config['model_answer'],
+            rubric=rubric,
+            language=config['language']
+        )
+        
+        submission = StudentSubmission(
+            answer=student_answer,
+            language=lang
+        )
+        
+        # Grade the submission
+        report = GradingEngine.grade_submission(assessment, submission)
+        
+        # Store results in session
+        session['grading_report'] = {
+            'total_score': report.total_score,
+            'max_score': report.max_score,
+            'percentage': (report.total_score / report.max_score * 100) if report.max_score > 0 else 0,
+            'criterion_results': [
+                {
+                    'criterion_name': r.criterion_name,
+                    'status': r.status,
+                    'marks_awarded': r.marks_awarded,
+                    'marks_total': r.marks_total,
+                    'justification': r.justification
+                } for r in report.criterion_results
+            ],
+            'feedback': report.feedback
+        }
+        session['student_answer'] = student_answer
+        
+        return redirect(url_for('page3', lang=lang))
+    
+    # GET request
+    return render_template_string(
+        PAGE2_TEMPLATE,
+        lang=lang,
+        t=t,
+        question=config['question'],
+        student_answer=session.get('student_extracted_answer', ''),
+        student_extracted_text=session.get('student_extracted_text', ''),
+        lti_user=session.get('lti_user_name'),
+        lti_role=session.get('lti_role')
+    )
+
+@app.route('/page3')
+def page3():
+    """Results page"""
+    lang = request.args.get('lang', session.get('language', 'en'))
+    
+    if 'grading_report' not in session:
+        return redirect(url_for('page1', lang=lang))
+    
+    report = session['grading_report']
+    
+    return render_template_string(
+        PAGE3_TEMPLATE,
+        lang=lang,
+        t=t,
+        total_score=report['total_score'],
+        max_score=report['max_score'],
+        percentage=report['percentage'],
+        criterion_results=report['criterion_results'],
+        feedback=report['feedback'],
+        student_answer=session.get('student_answer', ''),
+        lti_user=session.get('lti_user_name'),
+        lti_role=session.get('lti_role')
+    )
+
+@app.route('/reset')
+def reset():
+    """Reset session"""
+    lang = session.get('language', 'en')
+    session.clear()
+    session['language'] = lang
+    return redirect(url_for('page1', lang=lang))
+
+# ============================================================================
+# MAIN
+# ============================================================================
 
 if __name__ == '__main__':
-    print("\n" + "="*70)
-    print("🚀 MOQAYIM LTI SERVER STARTING")
-    print("="*70)
-    print(f"📍 Streamlit App URL: {STREAMLIT_URL}")
-    print(f"🔑 LTI Provider Key: moqayim_key")
-    print(f"🔐 LTI Provider Secret: moqayim_secret")
-    print("="*70 + "\n")
-    
-    # Render uses PORT environment variable
-    port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=True)
