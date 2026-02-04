@@ -576,8 +576,14 @@ def validate_lti_request(request_data):
 # HTML TEMPLATES
 # ============================================================================
 
-def render_page(content_html, lang, **kwargs):
+def render_page(content_template, lang, **kwargs):
     """Render a page with the base template"""
+    from flask import render_template_string
+    
+    # First render the content template with all variables
+    content_html = render_template_string(content_template, lang=lang, t=t, **kwargs)
+    
+    # Then render the base template with the rendered content
     base = """
 <!DOCTYPE html>
 <html lang="{{ 'ar' if lang == 'ar' else 'en' }}" dir="{{ 'rtl' if lang == 'ar' else 'ltr' }}">
