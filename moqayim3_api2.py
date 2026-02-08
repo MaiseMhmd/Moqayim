@@ -1,5 +1,6 @@
 import streamlit as st
 import re
+import json
 from dataclasses import dataclass, field
 from typing import List, Dict, Literal, Optional
 from collections import Counter
@@ -9,7 +10,6 @@ import io
 import base64
 import os
 from dotenv import load_dotenv
-import requests  # ADD THIS LINE
 
 # Load environment variables
 load_dotenv()
@@ -33,27 +33,7 @@ try:
 except ImportError:
     PDF2IMAGE_AVAILABLE = False
 
-
-# Add this BEFORE init_session_state()
-def get_session_from_api(session_id):
-    """Fetch session from Flask LTI server"""
-    # REPLACE THIS URL with your actual Render URL once deployed
-    FLASK_API_URL = os.environ.get('FLASK_API_URL', 'https://moqayim.onrender.com')
-    
-    try:
-        response = requests.get(
-            f"{FLASK_API_URL}/api/session/{session_id}",
-            timeout=5
-        )
-        if response.status_code == 200:
-            return response.json()
-        else:
-            print(f"Session not found: {session_id}")
-            return None
-    except Exception as e:
-        print(f"Error fetching session: {str(e)}")
-        return None
-
+from database import get_session
 
 def init_session_state():
     """Initialize session state variables"""
@@ -62,10 +42,10 @@ def init_session_state():
     query_params = st.query_params
     if 'session' in query_params:
         session_id = query_params['session']
-        role = query_params.get('role', ['student'])[0] if isinstance(query_params.get('role'), list) else query_params.get('role', 'student')
+        role = query_params.get('role', 'student')
         
-        # Load LTI session data from Flask API
-        lti_data = get_session_from_api(session_id)
+        # Load LTI session data
+        lti_data = get_session(session_id)
         if lti_data:
             st.session_state.lti_session = lti_data
             st.session_state.user_role = role
@@ -81,9 +61,10 @@ def init_session_state():
 
 @dataclass
 class RubricCriterion:
-    """Single grading criterion with marks allocation"""
+    """Single grading criterion with marks allocation and its own model answer"""
     name: str
     marks: int
+    model_answer: str = ""
     key_points: List[str] = field(default_factory=list)
     hints: List[str] = field(default_factory=list)
 
@@ -91,14 +72,19 @@ class RubricCriterion:
 class AssessmentConfig:
     """Teacher-defined assessment configuration"""
     question: str
-    model_answer: str
     rubric: List[RubricCriterion]
     language: Literal["en", "ar"] = "en"
 
 @dataclass
-class StudentSubmission:
-    """Student's submitted answer"""
+class CriterionSubmission:
+    """Student's answer for one criterion"""
+    criterion_name: str
     answer: str
+
+@dataclass
+class StudentSubmission:
+    """Student's submitted answers for all criteria"""
+    criterion_answers: List[CriterionSubmission]
     language: Literal["en", "ar"] = "en"
 
 @dataclass
@@ -312,249 +298,290 @@ class DocumentProcessor:
         except Exception as e:
             st.error(f"File processing error: {str(e)}")
             return ""
-    
-    @staticmethod
-    def smart_split_qa(extracted_text: str) -> tuple[str, str]:
-        """
-        Intelligently split extracted text into question and answer.
-        Looks for common markers and patterns.
-        """
-        text = extracted_text.strip()
-        
-        # Remove page markers
-        text = re.sub(r'---\s*Page\s+\d+\s*---', '', text, flags=re.IGNORECASE)
-        text = re.sub(r'\s+', ' ', text).strip()
-        
-        # Common patterns for question/answer separation (case insensitive)
-        patterns = [
-            # Pattern 1: Question: ... Answer:
-            (r'(?i)question[:\s]+(.*?)(?:answer[:\s]+|model\s+answer[:\s]+|solution[:\s]+)(.*)', 1, 2),
-            # Pattern 2: Q: ... A:
-            (r'(?i)q[:\.\s]+(.*?)(?:a[:\.\s]+|ans[:\.\s]+)(.*)', 1, 2),
-            # Pattern 3: Just "Answer:" or "Solution:"
-            (r'(?i)(.*?)(?:answer[:\s]+|solution[:\s]+|model\s+answer[:\s]+)(.*)', 1, 2),
-        ]
-        
-        for pattern, q_group, a_group in patterns:
-            match = re.search(pattern, text, re.DOTALL)
-            if match:
-                question = match.group(q_group).strip()
-                answer = match.group(a_group).strip()
-                
-                # Only accept if both parts are substantial
-                if len(question) > 10 and len(answer) > 10:
-                    return question, answer
-        
-        # If no pattern found, try to split at roughly midpoint
-        lines = text.split('\n')
-        if len(lines) > 3:
-            mid = len(lines) // 2
-            question = '\n'.join(lines[:mid]).strip()
-            answer = '\n'.join(lines[mid:]).strip()
-        else:
-            # If very few lines, split by sentence count
-            sentences = re.split(r'[.!?]+', text)
-            mid = len(sentences) // 2
-            question = '.'.join(sentences[:mid]).strip()
-            answer = '.'.join(sentences[mid:]).strip()
-        
-        return question, answer
 
 # ============================================================================
 # GRADING ENGINE
 # ============================================================================
 
-class GradingEngine:
-    """Deterministic rubric-based grading engine"""
+class GroqGradingEngine:
+    """LLM-powered grading engine using Groq API"""
     
-    @staticmethod
-    def normalize_text(text: str) -> str:
-        """Normalize text for comparison"""
-        text = text.lower()
-        text = re.sub(r'[^\w\s]', ' ', text)
-        text = re.sub(r'\s+', ' ', text)
-        return text.strip()
+    def __init__(self, api_key: Optional[str] = None):
+        """Initialize Groq client"""
+        if not GROQ_AVAILABLE:
+            raise ImportError("Groq library not installed. Run: pip install groq")
+        
+        self.client = Groq(api_key=api_key) if api_key else Groq()
+        self.model = "llama-3.3-70b-versatile"  # Best for reasoning tasks
     
-    @staticmethod
-    def tokenize(text: str) -> List[str]:
-        """Split normalized text into tokens"""
-        return GradingEngine.normalize_text(text).split()
-    
-    @staticmethod
-    def calculate_overlap(student_tokens: List[str], reference_tokens: List[str]) -> float:
-        """Calculate token overlap ratio"""
-        if not reference_tokens:
-            return 0.0
-        student_set = set(student_tokens)
-        reference_set = set(reference_tokens)
-        intersection = len(student_set & reference_set)
-        return intersection / len(reference_set)
-    
-    @staticmethod
-    def calculate_cosine_similarity(student_tokens: List[str], reference_tokens: List[str]) -> float:
-        """Calculate TF-based cosine similarity"""
-        if not student_tokens or not reference_tokens:
-            return 0.0
-        
-        student_counts = Counter(student_tokens)
-        reference_counts = Counter(reference_tokens)
-        
-        all_terms = set(student_counts.keys()) | set(reference_counts.keys())
-        
-        dot_product = sum(student_counts[term] * reference_counts[term] for term in all_terms)
-        
-        student_mag = math.sqrt(sum(count ** 2 for count in student_counts.values()))
-        reference_mag = math.sqrt(sum(count ** 2 for count in reference_counts.values()))
-        
-        if student_mag == 0 or reference_mag == 0:
-            return 0.0
-        
-        return dot_product / (student_mag * reference_mag)
-    
-    @staticmethod
-    def check_key_points(student_text: str, key_points: List[str]) -> tuple[int, int, List[str]]:
-        """Check how many key points are present"""
-        if not key_points:
-            return 0, 0, []
-        
-        student_norm = GradingEngine.normalize_text(student_text)
-        found_points = []
-        
-        for point in key_points:
-            point_norm = GradingEngine.normalize_text(point)
-            if point_norm in student_norm or any(term in student_norm for term in point_norm.split()):
-                found_points.append(point)
-        
-        return len(found_points), len(key_points), found_points
-    
-    @staticmethod
-    def evaluate_criterion(
-        student_answer: str,
-        model_answer: str,
-        criterion: RubricCriterion
-    ) -> CriterionResult:
-        """Evaluate a single criterion"""
-        
-        student_tokens = GradingEngine.tokenize(student_answer)
-        model_tokens = GradingEngine.tokenize(model_answer)
-        
-        # Calculate similarity metrics
-        overlap_score = GradingEngine.calculate_overlap(student_tokens, model_tokens)
-        cosine_score = GradingEngine.calculate_cosine_similarity(student_tokens, model_tokens)
-        
-        # Check key points
-        found_count, total_count, found_points = GradingEngine.check_key_points(
-            student_answer, criterion.key_points
-        )
-        
-        # Calculate combined score
-        if total_count > 0:
-            key_point_score = found_count / total_count
-        else:
-            key_point_score = (overlap_score + cosine_score) / 2
-        
-        # Determine status and marks
-        if key_point_score >= 0.8:
-            status = "met"
-            marks = criterion.marks
-        elif key_point_score >= 0.4:
-            status = "partial"
-            marks = max(1, criterion.marks // 2) if criterion.marks > 1 else 0
-        else:
-            status = "not_met"
-            marks = 0
-        
-        # Generate justification
-        justification = GradingEngine.generate_justification(
-            criterion, found_count, total_count, found_points, 
-            key_point_score, status
-        )
-        
-        return CriterionResult(
-            criterion_name=criterion.name,
-            status=status,
-            marks_awarded=marks,
-            marks_total=criterion.marks,
-            justification=justification
-        )
-    
-    @staticmethod
-    def generate_justification(
+    def grade_criterion(
+        self,
+        question: str,
         criterion: RubricCriterion,
-        found_count: int,
-        total_count: int,
-        found_points: List[str],
-        score: float,
-        status: str
-    ) -> str:
-        """Generate human-readable justification"""
+        student_answer: str,
+        language: str = "en"
+    ) -> CriterionResult:
+        """
+        Grade a single criterion using Groq LLM.
+        This is called ONCE for EACH criterion independently.
+        """
         
-        if status == "met":
-            if total_count > 0:
-                return f"✓ All required elements present ({found_count}/{total_count} key points identified)."
-            return f"✓ Criterion fully satisfied with strong alignment to model answer."
+        # Build the grading prompt
+        prompt = self._build_grading_prompt(
+            question=question,
+            criterion=criterion,
+            student_answer=student_answer,
+            language=language
+        )
         
-        elif status == "partial":
-            if total_count > 0:
-                missing = total_count - found_count
-                return f"⚬ Partially satisfied: {found_count}/{total_count} key points present. Missing {missing} element(s)."
-            return f"⚬ Partially satisfied: some relevant content present but incomplete coverage."
-        
-        else:  # not_met
-            if total_count > 0:
-                return f"✗ Not satisfied: {found_count}/{total_count} key points identified. Missing critical elements."
-            return f"✗ Not satisfied: insufficient alignment with expected answer."
+        try:
+            # Call Groq API
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": self._get_system_prompt(language)
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                temperature=0.1,  # Low temperature for consistent grading
+                max_tokens=500,
+                response_format={"type": "json_object"}  # Force JSON output
+            )
+            
+            # Parse the JSON response
+            result_json = json.loads(response.choices[0].message.content)
+            
+            # Extract grading information
+            marks_awarded = int(result_json.get("marks_awarded", 0))
+            marks_awarded = max(0, min(marks_awarded, criterion.marks))  # Clamp to valid range
+            
+            justification = result_json.get("justification", "No justification provided")
+            
+            # Determine status
+            percentage = marks_awarded / criterion.marks if criterion.marks > 0 else 0
+            if percentage >= 0.85:
+                status = "met"
+            elif percentage >= 0.40:
+                status = "partial"
+            else:
+                status = "not_met"
+            
+            return CriterionResult(
+                criterion_name=criterion.name,
+                status=status,
+                marks_awarded=marks_awarded,
+                marks_total=criterion.marks,
+                justification=justification
+            )
+            
+        except Exception as e:
+            # Fallback on error
+            return CriterionResult(
+                criterion_name=criterion.name,
+                status="not_met",
+                marks_awarded=0,
+                marks_total=criterion.marks,
+                justification=f"Error during grading: {str(e)}"
+            )
     
-    @staticmethod
+    def _get_system_prompt(self, language: str) -> str:
+        """Get system prompt for the LLM"""
+        
+        if language == "ar":
+            return """أنت مصحح خبير للإجابات القصيرة. مهمتك هي تقييم إجابات الطلاب بناءً على معايير محددة.
+
+قواعد التصحيح:
+1. قيّم فهم الطالب المفاهيمي، وليس فقط وجود الكلمات المفتاحية
+2. تحقق من الدقة العلمية - اكتشف الأخطاء المفاهيمية
+3. اكتشف العلاقات السببية المعكوسة (مثال: "أ يسبب ب" مقابل "ب يسبب أ")
+4. أعط علامات جزئية للفهم الجزئي
+5. كن عادلاً ومتسقاً
+6. أرجع النتائج بصيغة JSON فقط
+
+صيغة JSON المطلوبة:
+{
+  "marks_awarded": <رقم من 0 إلى الحد الأقصى>,
+  "justification": "<تفسير مختصر بالعربية>"
+}"""
+        else:
+            return """You are an expert grader for short-answer questions. Your job is to evaluate student answers against specific criteria.
+
+Grading Rules:
+1. Evaluate conceptual understanding, not just keyword presence
+2. Check for scientific/factual accuracy - catch conceptual errors
+3. Detect reversed causation (e.g., "A causes B" vs "B causes A")
+4. Award partial credit for partial understanding
+5. Be fair and consistent
+6. Return results in JSON format only
+
+Required JSON format:
+{
+  "marks_awarded": <number from 0 to max>,
+  "justification": "<brief explanation in English>"
+}"""
+    
+    def _build_grading_prompt(
+        self,
+        question: str,
+        criterion: RubricCriterion,
+        student_answer: str,
+        language: str
+    ) -> str:
+        """Build the grading prompt for a specific criterion"""
+        
+        if language == "ar":
+            prompt = f"""**السؤال:**
+{question}
+
+**المعيار المراد تقييمه:**
+- الاسم: {criterion.name}
+- الدرجة القصوى: {criterion.marks}
+
+**الإجابة النموذجية لهذا المعيار:**
+{criterion.model_answer}
+
+**إجابة الطالب لهذا المعيار:**
+{student_answer}
+"""
+            
+            if criterion.key_points:
+                prompt += f"\n**النقاط الرئيسية المطلوبة:**\n"
+                for i, point in enumerate(criterion.key_points, 1):
+                    prompt += f"{i}. {point}\n"
+            
+            if criterion.hints:
+                prompt += f"\n**إرشادات التصحيح:**\n"
+                for hint in criterion.hints:
+                    prompt += f"- {hint}\n"
+            
+            prompt += f"""
+**المطلوب:**
+قيّم إجابة الطالب لهذا المعيار فقط ({criterion.name}). أعط درجة من 0 إلى {criterion.marks}.
+
+اعتبارات مهمة:
+- هل المفهوم صحيح علمياً؟
+- هل تم ذكر النقاط الرئيسية؟
+- هل هناك أخطاء مفاهيمية؟
+- هل الإجابة كاملة أم ناقصة؟
+
+أرجع النتيجة بصيغة JSON فقط."""
+        
+        else:  # English
+            prompt = f"""**Question:**
+{question}
+
+**Criterion to Evaluate:**
+- Name: {criterion.name}
+- Maximum Marks: {criterion.marks}
+
+**Model Answer for this Criterion:**
+{criterion.model_answer}
+
+**Student Answer for this Criterion:**
+{student_answer}
+"""
+            
+            if criterion.key_points:
+                prompt += f"\n**Required Key Points:**\n"
+                for i, point in enumerate(criterion.key_points, 1):
+                    prompt += f"{i}. {point}\n"
+            
+            if criterion.hints:
+                prompt += f"\n**Grading Hints:**\n"
+                for hint in criterion.hints:
+                    prompt += f"- {hint}\n"
+            
+            prompt += f"""
+**Task:**
+Evaluate the student's answer for THIS criterion only ({criterion.name}). Award marks from 0 to {criterion.marks}.
+
+Important considerations:
+- Is the concept scientifically/factually correct?
+- Are the key points addressed?
+- Are there any conceptual errors?
+- Is the answer complete or partial?
+
+Return result in JSON format only."""
+        
+        return prompt
+    
     def generate_feedback(
+        self,
         criterion_results: List[CriterionResult],
-        rubric: List[RubricCriterion]
+        rubric: List[RubricCriterion],
+        language: str = "en"
     ) -> List[str]:
         """Generate actionable feedback based on results"""
         
         feedback = []
         
         for result in criterion_results:
-            if result.status == "not_met":
-                criterion = next(c for c in rubric if c.name == result.criterion_name)
-                if criterion.hints:
-                    feedback.append(f"Add {criterion.name.lower()}: {criterion.hints[0]}")
-                else:
-                    feedback.append(f"Include {criterion.name.lower()} in your answer.")
+            criterion = next(c for c in rubric if c.name == result.criterion_name)
             
-            elif result.status == "partial":
-                criterion = next(c for c in rubric if c.name == result.criterion_name)
-                if criterion.key_points:
-                    feedback.append(f"Strengthen {criterion.name.lower()}: ensure all required details are covered.")
-                elif criterion.hints:
-                    feedback.append(f"Improve {criterion.name.lower()}: {criterion.hints[0]}")
+            percentage = result.marks_awarded / result.marks_total if result.marks_total > 0 else 0
+            
+            if percentage < 0.5:  # Less than 50%
+                if language == "ar":
+                    if criterion.hints:
+                        feedback.append(f"حسّن {criterion.name}: {criterion.hints[0]}")
+                    else:
+                        feedback.append(f"أضف المزيد من التفاصيل في {criterion.name}")
+                else:
+                    if criterion.hints:
+                        feedback.append(f"Improve {criterion.name}: {criterion.hints[0]}")
+                    else:
+                        feedback.append(f"Add more detail to {criterion.name}")
         
         if not feedback:
-            feedback.append("Excellent work! All criteria met.")
+            if language == "ar":
+                feedback.append("عمل ممتاز! جميع المعايير تم تحقيقها بشكل جيد.")
+            else:
+                feedback.append("Excellent work! All criteria well addressed.")
         
-        return feedback[:4]
+        return feedback[:5]
     
-    @staticmethod
     def grade_submission(
-        config: AssessmentConfig,
-        submission: StudentSubmission
+        self,
+        question: str,
+        rubric: List[RubricCriterion],
+        criterion_answers: List[CriterionSubmission],
+        language: str = "en"
     ) -> GradingReport:
-        """Grade a student submission against assessment configuration"""
+        """
+        Grade a complete student submission.
+        Calls the LLM ONCE for EACH criterion independently.
+        """
         
         criterion_results = []
         
-        for criterion in config.rubric:
-            result = GradingEngine.evaluate_criterion(
-                submission.answer,
-                config.model_answer,
-                criterion
+        # Grade each criterion independently
+        for criterion in rubric:
+            # Find the student's answer for this criterion
+            student_answer = next(
+                (ca.answer for ca in criterion_answers if ca.criterion_name == criterion.name),
+                ""
             )
+            
+            result = self.grade_criterion(
+                question=question,
+                criterion=criterion,
+                student_answer=student_answer,
+                language=language
+            )
+            
             criterion_results.append(result)
         
+        # Calculate totals
         total_score = sum(r.marks_awarded for r in criterion_results)
         max_score = sum(r.marks_total for r in criterion_results)
         
-        feedback = GradingEngine.generate_feedback(criterion_results, config.rubric)
+        # Generate feedback
+        feedback = self.generate_feedback(criterion_results, rubric, language)
         
         return GradingReport(
             criterion_results=criterion_results,
@@ -562,6 +589,45 @@ class GradingEngine:
             max_score=max_score,
             feedback=feedback
         )
+
+
+class GradingEngine:
+    """
+    Wrapper class that uses Groq LLM for grading.
+    Drop-in replacement for your existing GradingEngine.
+    """
+    
+    @staticmethod
+    def grade_submission(config: AssessmentConfig, submission: StudentSubmission) -> GradingReport:
+        """
+        Grade submission using Groq LLM.
+        
+        Args:
+            config: AssessmentConfig with question and rubric
+            submission: StudentSubmission with criterion answers
+        
+        Returns:
+            GradingReport with criterion results
+        """
+        
+        # Get API key from environment
+        api_key = os.environ.get("GROQ_API_KEY")
+        
+        if not api_key:
+            raise ValueError("GROQ_API_KEY environment variable not set")
+        
+        # Initialize Groq grading engine
+        grader = GroqGradingEngine(api_key=api_key)
+        
+        # Grade the submission
+        report = grader.grade_submission(
+            question=config.question,
+            rubric=config.rubric,
+            criterion_answers=submission.criterion_answers,
+            language=config.language
+        )
+        
+        return report
 
 # ============================================================================
 # UI TRANSLATIONS
@@ -578,6 +644,7 @@ TRANSLATIONS = {
         "rubric_label": "Rubric Criteria",
         "criterion_name": "Criterion Name",
         "criterion_marks": "Marks",
+        "criterion_model_answer": "Model Answer for this Criterion",
         "criterion_desc": "Description",
         "key_points": "Key Points (comma-separated, optional)",
         "hints": "Hints (comma-separated, optional)",
@@ -598,7 +665,8 @@ TRANSLATIONS = {
         "upload_hint": "Upload a PDF or image containing the question and model answer",
         "copy_text": "Copy Extracted Text",
         "text_copied": "Text copied to clipboard!",
-        "use_extracted": "Use Extracted Text"
+        "use_extracted": "Use Extracted Text",
+        "answer_for_criterion": "Answer for"
     },
     "ar": {
         "app_title": "مُقَيِّم - تصحيح الإجابات القصيرة",
@@ -610,6 +678,7 @@ TRANSLATIONS = {
         "rubric_label": "معايير التقييم",
         "criterion_name": "اسم المعيار",
         "criterion_marks": "الدرجات",
+        "criterion_model_answer": "الإجابة النموذجية لهذا المعيار",
         "criterion_desc": "الوصف",
         "key_points": "النقاط الرئيسية (مفصولة بفواصل، اختياري)",
         "hints": "التلميحات (مفصولة بفواصل، اختياري)",
@@ -630,7 +699,8 @@ TRANSLATIONS = {
         "upload_hint": "قم بتحميل PDF أو صورة تحتوي على السؤال والإجابة النموذجية",
         "copy_text": "نسخ النص المستخرج",
         "text_copied": "تم نسخ النص!",
-        "use_extracted": "استخدام النص المستخرج"
+        "use_extracted": "استخدام النص المستخرج",
+        "answer_for_criterion": "الإجابة لـ"
     }
 }
 
@@ -654,14 +724,11 @@ def init_session_state():
         "assessment_config": None,
         "student_submission": None,
         "grading_report": None,
-        "num_criteria": 3,
+        "num_criteria": 1,  # Start with 1 criterion
         "extracted_question": "",
-        "extracted_answer": "",
-        "student_extracted_answer": "",
         "last_teacher_file": None,
         "last_student_file": None,
         "last_extracted_text": "",
-        "last_student_extracted_text": ""
     }
     
     for key, value in defaults.items():
@@ -692,56 +759,6 @@ def page1_teacher_setup():
     
     st.divider()
     
-    # Document Upload Section
-    st.subheader("📄 " + t("upload_document"))
-    st.caption(t("upload_hint"))
-    
-    uploaded_file = st.file_uploader(
-        t("upload_document"),
-        type=["pdf", "png", "jpg", "jpeg"],
-        key="teacher_upload",
-        label_visibility="collapsed"
-    )
-    
-    if uploaded_file and api_key:
-        file_key = f"{uploaded_file.name}_{uploaded_file.size}"
-        
-        if st.session_state.get("last_teacher_file") != file_key:
-            with st.spinner(t("processing")):
-                try:
-                    extracted_text = DocumentProcessor.process_uploaded_file(
-                        uploaded_file, 
-                        st.session_state.language,
-                        api_key
-                    )
-                    
-                    if extracted_text:
-                        question, answer = DocumentProcessor.smart_split_qa(extracted_text)
-                        st.session_state.extracted_question = question
-                        st.session_state.extracted_answer = answer
-                        st.session_state.last_teacher_file = file_key
-                        st.session_state.last_extracted_text = extracted_text
-                        st.success("✓ Text extracted and fields auto-filled!")
-                        st.rerun()
-                except Exception as e:
-                    st.error(f"Error: {str(e)}")
-        else:
-            if "last_extracted_text" in st.session_state and st.session_state.last_extracted_text:
-                with st.expander("📝 " + t("extracted_text"), expanded=False):
-                    st.text_area(
-                        "Raw Extracted Text",
-                        st.session_state.last_extracted_text,
-                        height=200,
-                        key="teacher_extracted_display"
-                    )
-                    
-                    col1, col2 = st.columns([1, 4])
-                    with col1:
-                        if st.button("📋 " + t("copy_text"), key="copy_teacher"):
-                            st.success(t("text_copied"))
-    
-    st.divider()
-    
     # Question input
     question = st.text_area(
         t("question_label"),
@@ -751,14 +768,7 @@ def page1_teacher_setup():
         key="question_input"
     )
     
-    # Model answer
-    model_answer = st.text_area(
-        t("model_answer_label"),
-        value=st.session_state.get("extracted_answer", ""),
-        height=150,
-        placeholder="e.g., Photosynthesis is the process by which plants convert light energy into chemical energy...",
-        key="model_answer_input"
-    )
+    st.divider()
     
     # Rubric criteria
     st.subheader(t("rubric_label"))
@@ -773,7 +783,7 @@ def page1_teacher_setup():
                 name = st.text_input(
                     t("criterion_name"),
                     key=f"crit_name_{i}",
-                    placeholder="e.g., Definition"
+                    placeholder="e.g., Definition of Photosynthesis"
                 )
             with col2:
                 marks = st.number_input(
@@ -783,6 +793,14 @@ def page1_teacher_setup():
                     value=2,
                     key=f"crit_marks_{i}"
                 )
+            
+            # Model answer for this criterion
+            model_answer = st.text_area(
+                t("criterion_model_answer"),
+                key=f"crit_model_{i}",
+                height=100,
+                placeholder="e.g., Photosynthesis is the process by which plants convert light energy into chemical energy..."
+            )
             
             key_points_str = st.text_input(
                 t("key_points"),
@@ -803,6 +821,7 @@ def page1_teacher_setup():
                 rubric.append(RubricCriterion(
                     name=name,
                     marks=marks,
+                    model_answer=model_answer,
                     key_points=key_points,
                     hints=hints
                 ))
@@ -813,17 +832,21 @@ def page1_teacher_setup():
     
     # Navigation
     if st.button(t("next"), type="primary"):
-        if not question or not model_answer or len(rubric) == 0:
-            st.error("Please fill in all required fields.")
+        if not question or len(rubric) == 0:
+            st.error("Please fill in the question and at least one criterion.")
         else:
-            st.session_state.assessment_config = AssessmentConfig(
-                question=question,
-                model_answer=model_answer,
-                rubric=rubric,
-                language=st.session_state.language
-            )
-            st.session_state.page = 2
-            st.rerun()
+            # Check that all criteria have model answers
+            missing_answers = [c.name for c in rubric if not c.model_answer.strip()]
+            if missing_answers:
+                st.error(f"Please provide model answers for: {', '.join(missing_answers)}")
+            else:
+                st.session_state.assessment_config = AssessmentConfig(
+                    question=question,
+                    rubric=rubric,
+                    language=st.session_state.language
+                )
+                st.session_state.page = 2
+                st.rerun()
 
 def page2_student_answer():
     """Page 2: Student Answer Simulation"""
@@ -837,67 +860,59 @@ def page2_student_answer():
     
     st.divider()
     
-    # Document Upload Section for Student
-    st.subheader("📄 " + t("upload_document"))
-    st.caption("Upload a scanned document or image of the student's handwritten answer")
-    
+    # Get API key for OCR
     api_key = os.environ.get("GROQ_API_KEY")
     
-    if not api_key:
-        st.warning("⚠️ Please set your GROQ_API_KEY environment variable to use OCR features.")
+    # Collect answers for each criterion
+    criterion_submissions = []
     
-    uploaded_student_file = st.file_uploader(
-        t("upload_document"),
-        type=["pdf", "png", "jpg", "jpeg"],
-        key="student_upload",
-        label_visibility="collapsed"
-    )
-    
-    if uploaded_student_file and api_key:
-        file_key = f"{uploaded_student_file.name}_{uploaded_student_file.size}"
+    for i, criterion in enumerate(config.rubric):
+        st.subheader(f"📝 {criterion.name} ({criterion.marks} marks)")
         
-        if st.session_state.get("last_student_file") != file_key:
-            with st.spinner(t("processing")):
-                try:
-                    extracted_student_text = DocumentProcessor.process_uploaded_file(
-                        uploaded_student_file, 
-                        st.session_state.language,
-                        api_key
-                    )
-                    
-                    if extracted_student_text:
-                        st.session_state.student_extracted_answer = extracted_student_text
-                        st.session_state.last_student_file = file_key
-                        st.session_state.last_student_extracted_text = extracted_student_text
-                        st.success("✓ Student answer extracted and auto-filled!")
-                        st.rerun()
-                except Exception as e:
-                    st.error(f"Error: {str(e)}")
-        else:
-            if "last_student_extracted_text" in st.session_state and st.session_state.last_student_extracted_text:
-                with st.expander("📝 " + t("extracted_text"), expanded=False):
-                    st.text_area(
-                        "Raw Extracted Text",
-                        st.session_state.last_student_extracted_text,
-                        height=200,
-                        key="student_extracted_display"
-                    )
-                    
-                    col1, col2 = st.columns([1, 4])
-                    with col1:
-                        if st.button("📋 " + t("copy_text"), key="copy_student"):
-                            st.success(t("text_copied"))
-    
-    st.divider()
-    
-    # Student answer input
-    student_answer = st.text_area(
-        t("student_answer_label"),
-        value=st.session_state.get("student_extracted_answer", ""),
-        height=200,
-        placeholder="Type your answer here...",
-        key="student_answer_input"
-    )
+        # Optional: Document upload for this criterion
+        if api_key:
+            uploaded_file = st.file_uploader(
+                f"Upload answer image for {criterion.name} (optional)",
+                type=["pdf", "png", "jpg", "jpeg"],
+                key=f"student_upload_{i}"
+            )
+            
+            if uploaded_file:
+                file_key = f"{uploaded_file.name}_{uploaded_file.size}_{i}"
+                
+                if st.session_state.get(f"last_file_{i}") != file_key:
+                    with st.spinner(t("processing")):
+                        try:
+                            extracted_text = DocumentProcessor.process_uploaded_file(
+                                uploaded_file, 
+                                st.session_state.language,
+                                api_key
+                            )
+                            
+                            if extracted_text:
+                                st.session_state[f"extracted_answer_{i}"] = extracted_text
+                                st.session_state[f"last_file_{i}"] = file_key
+                                st.success("✓ Text extracted!")
+                                st.rerun()
+                        except Exception as e:
+                            st.error(f"Error: {str(e)}")
+        
+        # Answer text area
+        answer = st.text_area(
+            f"{t('answer_for_criterion')} {criterion.name}",
+            value=st.session_state.get(f"extracted_answer_{i}", ""),
+            height=150,
+            placeholder=f"Type your answer for {criterion.name}...",
+            key=f"student_answer_{i}"
+        )
+        
+        if answer.strip():
+            criterion_submissions.append(CriterionSubmission(
+                criterion_name=criterion.name,
+                answer=answer
+            ))
+        
+        st.divider()
     
     # Navigation
     col1, col2 = st.columns(2)
@@ -909,16 +924,17 @@ def page2_student_answer():
     
     with col2:
         if st.button(t("submit_answer"), type="primary"):
-            if not student_answer.strip():
-                st.error("Please provide an answer.")
+            if len(criterion_submissions) != len(config.rubric):
+                st.error("Please provide answers for all criteria.")
             else:
                 submission = StudentSubmission(
-                    answer=student_answer,
+                    criterion_answers=criterion_submissions,
                     language=st.session_state.language
                 )
                 
                 # Grade the submission
-                report = GradingEngine.grade_submission(config, submission)
+                with st.spinner("Grading your answers..."):
+                    report = GradingEngine.grade_submission(config, submission)
                 
                 st.session_state.student_submission = submission
                 st.session_state.grading_report = report
@@ -956,16 +972,22 @@ def page3_results():
             f"{status_color} {result.criterion_name} - {result.marks_awarded}/{result.marks_total}",
             expanded=True
         ):
+            st.write("**Justification:**")
             st.write(result.justification)
+            
+            # Show student's answer for this criterion
+            student_answer = next(
+                (ca.answer for ca in submission.criterion_answers if ca.criterion_name == result.criterion_name),
+                ""
+            )
+            
+            with st.expander("View your answer"):
+                st.write(student_answer)
     
     # Feedback
     st.subheader(t("feedback"))
     for i, fb in enumerate(report.feedback, 1):
         st.write(f"{i}. {fb}")
-    
-    # Show student answer
-    with st.expander("View Student Answer"):
-        st.write(submission.answer)
     
     # Navigation
     col1, col2 = st.columns(2)
@@ -1021,5 +1043,4 @@ def main():
         page3_results()
 
 if __name__ == "__main__":
-
     main()
