@@ -56,9 +56,10 @@ os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
 @dataclass
 class RubricCriterion:
-    """Single grading criterion with marks allocation"""
+    """Single grading criterion with marks allocation and its own model answer"""
     name: str
     marks: int
+    model_answer: str = ""
     key_points: List[str] = field(default_factory=list)
     hints: List[str] = field(default_factory=list)
 
@@ -66,14 +67,19 @@ class RubricCriterion:
 class AssessmentConfig:
     """Teacher-defined assessment configuration"""
     question: str
-    model_answer: str
     rubric: List[RubricCriterion]
     language: Literal["en", "ar"] = "en"
 
 @dataclass
-class StudentSubmission:
-    """Student's submitted answer"""
+class CriterionSubmission:
+    """Student's answer for one criterion"""
+    criterion_name: str
     answer: str
+
+@dataclass
+class StudentSubmission:
+    """Student's submitted answers for all criteria"""
+    criterion_answers: List[CriterionSubmission]
     language: Literal["en", "ar"] = "en"
 
 @dataclass
@@ -92,6 +98,7 @@ class GradingReport:
     total_score: int
     max_score: int
     feedback: List[str]
+    criterion_answers: List[CriterionSubmission]  # Store student answers per criterion
 
 # ============================================================================
 # GROQ OCR PROCESSING
@@ -365,11 +372,11 @@ class GradingEngine:
         return len(found_points), len(key_points), found_points
     
     @staticmethod
-    def evaluate_criterion(student_answer: str, model_answer: str, criterion: RubricCriterion) -> CriterionResult:
-        """Evaluate a single criterion"""
+    def evaluate_criterion(student_answer: str, criterion: RubricCriterion) -> CriterionResult:
+        """Evaluate a single criterion against its own model answer"""
         
         student_tokens = GradingEngine.tokenize(student_answer)
-        model_tokens = GradingEngine.tokenize(model_answer)
+        model_tokens = GradingEngine.tokenize(criterion.model_answer)
         
         overlap_score = GradingEngine.calculate_overlap(student_tokens, model_tokens)
         cosine_score = GradingEngine.calculate_cosine_similarity(student_tokens, model_tokens)
@@ -459,12 +466,17 @@ class GradingEngine:
         
         criterion_results = []
         
+        # Match student answers to criteria
         for criterion in config.rubric:
-            result = GradingEngine.evaluate_criterion(
-                submission.answer,
-                config.model_answer,
-                criterion
-            )
+            # Find the student's answer for this criterion
+            student_answer = ""
+            for crit_sub in submission.criterion_answers:
+                if crit_sub.criterion_name == criterion.name:
+                    student_answer = crit_sub.answer
+                    break
+            
+            # Evaluate this criterion
+            result = GradingEngine.evaluate_criterion(student_answer, criterion)
             criterion_results.append(result)
         
         total_score = sum(r.marks_awarded for r in criterion_results)
@@ -476,7 +488,8 @@ class GradingEngine:
             criterion_results=criterion_results,
             total_score=total_score,
             max_score=max_score,
-            feedback=feedback
+            feedback=feedback,
+            criterion_answers=submission.criterion_answers
         )
 
 # ============================================================================
@@ -490,7 +503,7 @@ TRANSLATIONS = {
         "page2_title": "Student Answer",
         "page3_title": "Grading Results",
         "question_label": "Question",
-        "model_answer_label": "Model Answer",
+        "model_answer_label": "Model Answer for this Criterion",
         "rubric_label": "Rubric Criteria",
         "criterion_name": "Criterion Name",
         "criterion_marks": "Marks",
@@ -518,7 +531,7 @@ TRANSLATIONS = {
         "page2_title": "إجابة الطالب",
         "page3_title": "نتائج التصحيح",
         "question_label": "السؤال",
-        "model_answer_label": "الإجابة النموذجية",
+        "model_answer_label": "الإجابة النموذجية لهذا المعيار",
         "rubric_label": "معايير التقييم",
         "criterion_name": "اسم المعيار",
         "criterion_marks": "الدرجات",
@@ -918,48 +931,15 @@ PAGE1_CONTENT = """
     </div>
     {% endif %}
     
-    <div class="divider"></div>
-    
-    <h3 style="margin-bottom: 15px;">📄 {{ t('upload_document', lang) }}</h3>
-    <p style="color: #666; margin-bottom: 15px; font-size: 14px;">{{ t('upload_hint', lang) }}</p>
-    
-    <div class="form-group">
-        <label class="file-upload">
-            <input type="file" name="document" accept=".pdf,.png,.jpg,.jpeg" onchange="this.form.submit()">
-            <div style="font-size: 48px; margin-bottom: 10px;">📤</div>
-            <div style="font-weight: 600; color: #667eea;">Click to upload PDF or Image</div>
-            <div style="font-size: 13px; color: #666; margin-top: 5px;">Supports PDF, PNG, JPG, JPEG</div>
-        </label>
-    </div>
-    
-    {% if extracted_text %}
-    <div class="alert alert-success">
-        ✓ Text extracted and fields auto-filled!
-    </div>
-    <details style="margin-bottom: 20px;">
-        <summary style="cursor: pointer; font-weight: 600; padding: 10px; background: #f9fafb; border-radius: 4px;">
-            📝 {{ t('extracted_text', lang) }}
-        </summary>
-        <textarea readonly style="margin-top: 10px; background: #f9fafb; font-family: monospace; font-size: 13px;">{{ extracted_text }}</textarea>
-    </details>
-    {% endif %}
-    
     {% if error %}
     <div class="alert alert-error">
         ❌ {{ error }}
     </div>
     {% endif %}
     
-    <div class="divider"></div>
-    
     <div class="form-group">
         <label>{{ t('question_label', lang) }}</label>
         <textarea name="question" placeholder="e.g., Explain the process of photosynthesis." required>{{ question or '' }}</textarea>
-    </div>
-    
-    <div class="form-group">
-        <label>{{ t('model_answer_label', lang) }}</label>
-        <textarea name="model_answer" style="min-height: 150px;" placeholder="e.g., Photosynthesis is the process by which plants convert light energy into chemical energy..." required>{{ model_answer or '' }}</textarea>
     </div>
     
     <div class="divider"></div>
@@ -977,6 +957,10 @@ PAGE1_CONTENT = """
                 <label>{{ t('criterion_marks', lang) }}</label>
                 <input type="number" name="criterion_marks_{{ i }}" min="1" max="10" value="2" required>
             </div>
+        </div>
+        <div class="form-group" style="margin-bottom: 10px;">
+            <label>{{ t('model_answer_label', lang) }}</label>
+            <textarea name="criterion_model_{{ i }}" style="min-height: 100px;" placeholder="Model answer for this criterion..." required></textarea>
         </div>
         <div class="form-group" style="margin-bottom: 10px;">
             <label>{{ t('key_points', lang) }}</label>
@@ -1009,42 +993,23 @@ PAGE2_CONTENT = """
 
 <form method="POST" enctype="multipart/form-data">
     
-    <h3 style="margin-bottom: 15px;">📄 {{ t('upload_document', lang) }}</h3>
-    <p style="color: #666; margin-bottom: 15px; font-size: 14px;">Upload a scanned document or image of the student's handwritten answer</p>
+    <h3 style="margin-bottom: 20px;">Answer Each Criterion</h3>
     
-    <div class="form-group">
-        <label class="file-upload">
-            <input type="file" name="student_document" accept=".pdf,.png,.jpg,.jpeg" onchange="this.form.submit()">
-            <div style="font-size: 48px; margin-bottom: 10px;">📤</div>
-            <div style="font-weight: 600; color: #667eea;">Click to upload PDF or Image</div>
-            <div style="font-size: 13px; color: #666; margin-top: 5px;">Supports PDF, PNG, JPG, JPEG</div>
-        </label>
+    {% for criterion in criteria %}
+    <div class="criterion-card">
+        <h4 style="margin-bottom: 15px; color: #667eea;">{{ criterion.name }} ({{ criterion.marks }} marks)</h4>
+        <div class="form-group">
+            <label>{{ t('student_answer_label', lang) }}</label>
+            <textarea name="answer_{{ loop.index0 }}" style="min-height: 120px;" placeholder="Type your answer for {{ criterion.name }}..." required></textarea>
+        </div>
     </div>
-    
-    {% if student_extracted_text %}
-    <div class="alert alert-success">
-        ✓ Student answer extracted and auto-filled!
-    </div>
-    <details style="margin-bottom: 20px;">
-        <summary style="cursor: pointer; font-weight: 600; padding: 10px; background: #f9fafb; border-radius: 4px;">
-            📝 {{ t('extracted_text', lang) }}
-        </summary>
-        <textarea readonly style="margin-top: 10px; background: #f9fafb; font-family: monospace; font-size: 13px;">{{ student_extracted_text }}</textarea>
-    </details>
-    {% endif %}
+    {% endfor %}
     
     {% if error %}
     <div class="alert alert-error">
         ❌ {{ error }}
     </div>
     {% endif %}
-    
-    <div class="divider"></div>
-    
-    <div class="form-group">
-        <label>{{ t('student_answer_label', lang) }}</label>
-        <textarea name="student_answer" style="min-height: 200px;" placeholder="Type your answer here..." required>{{ student_answer or '' }}</textarea>
-    </div>
     
     <div class="btn-group">
         <a href="{{ url_for('page1') }}" class="btn btn-secondary">{{ t('back', lang) }}</a>
@@ -1074,7 +1039,16 @@ PAGE3_CONTENT = """
         </div>
         <div class="result-score">{{ result.marks_awarded }}/{{ result.marks_total }}</div>
     </div>
-    <div style="color: #666; font-size: 14px;">{{ result.justification }}</div>
+    <div style="color: #666; font-size: 14px; margin-bottom: 10px;">{{ result.justification }}</div>
+    
+    {% for crit_ans in criterion_answers %}
+        {% if crit_ans.criterion_name == result.criterion_name %}
+        <details style="margin-top: 10px;">
+            <summary style="cursor: pointer; font-size: 13px; color: #667eea;">View your answer</summary>
+            <div style="margin-top: 8px; padding: 10px; background: #f9fafb; border-radius: 4px; font-size: 14px; white-space: pre-wrap;">{{ crit_ans.answer }}</div>
+        </details>
+        {% endif %}
+    {% endfor %}
 </div>
 {% endfor %}
 
@@ -1086,13 +1060,6 @@ PAGE3_CONTENT = """
     <li>{{ loop.index }}. {{ fb }}</li>
     {% endfor %}
 </ul>
-
-<details style="margin-top: 30px;">
-    <summary style="cursor: pointer; font-weight: 600; padding: 10px; background: #f9fafb; border-radius: 4px;">
-        View Student Answer
-    </summary>
-    <div style="margin-top: 15px; padding: 15px; background: #f9fafb; border-radius: 4px; white-space: pre-wrap;">{{ student_answer }}</div>
-</details>
 
 <div class="btn-group">
     <a href="{{ url_for('page2') }}" class="btn btn-secondary">{{ t('back', lang) }}</a>
@@ -1143,29 +1110,6 @@ def page1():
     session['language'] = lang
     
     if request.method == 'POST':
-        # Handle file upload
-        if 'document' in request.files and request.files['document'].filename:
-            file = request.files['document']
-            try:
-                extracted_text = DocumentProcessor.process_uploaded_file(file, lang, GROQ_API_KEY)
-                question, answer = DocumentProcessor.smart_split_qa(extracted_text)
-                session['extracted_question'] = question
-                session['extracted_answer'] = answer
-                session['extracted_text'] = extracted_text
-                return redirect(url_for('page1', lang=lang))
-            except Exception as e:
-                return render_page(
-                    PAGE1_CONTENT,
-                    lang,
-                    num_criteria=session.get('num_criteria', 3),
-                    error=str(e),
-                    groq_available=GROQ_AVAILABLE,
-                    groq_api_key=GROQ_API_KEY,
-                    lti_user=session.get('lti_user_name'),
-                    lti_role=session.get('lti_role'),
-                    url_for=url_for
-                )
-        
         # Handle add criterion
         if request.form.get('add_criterion'):
             session['num_criteria'] = session.get('num_criteria', 3) + 1
@@ -1173,7 +1117,6 @@ def page1():
         
         # Handle form submission
         question = request.form.get('question')
-        model_answer = request.form.get('model_answer')
         num_criteria = session.get('num_criteria', 3)
         
         rubric = []
@@ -1181,6 +1124,7 @@ def page1():
             name = request.form.get(f'criterion_name_{i}')
             if name:
                 marks = int(request.form.get(f'criterion_marks_{i}', 2))
+                model_answer = request.form.get(f'criterion_model_{i}', '')
                 key_points_str = request.form.get(f'criterion_kp_{i}', '')
                 hints_str = request.form.get(f'criterion_hints_{i}', '')
                 
@@ -1190,11 +1134,12 @@ def page1():
                 rubric.append({
                     'name': name,
                     'marks': marks,
+                    'model_answer': model_answer,
                     'key_points': key_points,
                     'hints': hints
                 })
         
-        if not question or not model_answer or len(rubric) == 0:
+        if not question or len(rubric) == 0:
             return render_page(
                 PAGE1_CONTENT,
                 lang,
@@ -1209,7 +1154,6 @@ def page1():
         
         session['assessment_config'] = {
             'question': question,
-            'model_answer': model_answer,
             'rubric': rubric,
             'language': lang
         }
@@ -1222,8 +1166,6 @@ def page1():
         lang,
         num_criteria=session.get('num_criteria', 3),
         question=session.get('extracted_question', ''),
-        model_answer=session.get('extracted_answer', ''),
-        extracted_text=session.get('extracted_text', ''),
         groq_available=GROQ_AVAILABLE,
         groq_api_key=GROQ_API_KEY,
         lti_user=session.get('lti_user_name'),
@@ -1242,44 +1184,34 @@ def page2():
     config = session['assessment_config']
     
     if request.method == 'POST':
-        # Handle file upload
-        if 'student_document' in request.files and request.files['student_document'].filename:
-            file = request.files['student_document']
-            try:
-                extracted_text = DocumentProcessor.process_uploaded_file(file, lang, GROQ_API_KEY)
-                session['student_extracted_answer'] = extracted_text
-                session['student_extracted_text'] = extracted_text
-                return redirect(url_for('page2', lang=lang))
-            except Exception as e:
+        # Collect answers for each criterion
+        criterion_answers = []
+        
+        for i, crit in enumerate(config['rubric']):
+            answer = request.form.get(f'answer_{i}', '').strip()
+            if not answer:
                 return render_page(
                     PAGE2_CONTENT,
                     lang,
                     question=config['question'],
-                    error=str(e),
+                    criteria=config['rubric'],
+                    error=f"Please provide an answer for {crit['name']}.",
                     lti_user=session.get('lti_user_name'),
                     lti_role=session.get('lti_role'),
                     url_for=url_for
                 )
-        
-        # Handle answer submission
-        student_answer = request.form.get('student_answer')
-        
-        if not student_answer or not student_answer.strip():
-            return render_page(
-                PAGE2_CONTENT,
-                lang,
-                question=config['question'],
-                error="Please provide an answer.",
-                lti_user=session.get('lti_user_name'),
-                lti_role=session.get('lti_role'),
-                url_for=url_for
-            )
+            
+            criterion_answers.append({
+                'criterion_name': crit['name'],
+                'answer': answer
+            })
         
         # Create assessment objects
         rubric = [
             RubricCriterion(
                 name=c['name'],
                 marks=c['marks'],
+                model_answer=c['model_answer'],
                 key_points=c['key_points'],
                 hints=c['hints']
             ) for c in config['rubric']
@@ -1287,13 +1219,17 @@ def page2():
         
         assessment = AssessmentConfig(
             question=config['question'],
-            model_answer=config['model_answer'],
             rubric=rubric,
             language=config['language']
         )
         
         submission = StudentSubmission(
-            answer=student_answer,
+            criterion_answers=[
+                CriterionSubmission(
+                    criterion_name=ca['criterion_name'],
+                    answer=ca['answer']
+                ) for ca in criterion_answers
+            ],
             language=lang
         )
         
@@ -1314,9 +1250,9 @@ def page2():
                     'justification': r.justification
                 } for r in report.criterion_results
             ],
-            'feedback': report.feedback
+            'feedback': report.feedback,
+            'criterion_answers': criterion_answers
         }
-        session['student_answer'] = student_answer
         
         return redirect(url_for('page3', lang=lang))
     
@@ -1325,8 +1261,7 @@ def page2():
         PAGE2_CONTENT,
         lang,
         question=config['question'],
-        student_answer=session.get('student_extracted_answer', ''),
-        student_extracted_text=session.get('student_extracted_text', ''),
+        criteria=config['rubric'],
         lti_user=session.get('lti_user_name'),
         lti_role=session.get('lti_role'),
         url_for=url_for
@@ -1350,7 +1285,7 @@ def page3():
         percentage=report['percentage'],
         criterion_results=report['criterion_results'],
         feedback=report['feedback'],
-        student_answer=session.get('student_answer', ''),
+        criterion_answers=report.get('criterion_answers', []),
         lti_user=session.get('lti_user_name'),
         lti_role=session.get('lti_role'),
         url_for=url_for
